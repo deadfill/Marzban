@@ -79,7 +79,7 @@ const SystemCronJobs = () => {
   const fetchSystemCronJobs = async () => {
     setLoading(true);
     try {
-      const { data } = await API.get("/api/messages/system-cron-jobs");
+      const { data } = await API.get("/messages/system-cron-jobs");
       setCronJobs(data.jobs);
     } catch (error) {
       console.error("Ошибка при получении системных CRON-задач:", error);
@@ -442,6 +442,10 @@ const Messages = () => {
                           onChange={handleMessageChange}
                           placeholder={t("messages.messagePlaceholder")}
                         />
+                      </Form.Item>
+                      
+                      <Form.Item name="image" label={t("messages.attachImage")}>
+                        <input type="file" accept="image/*" onChange={handleImageChange} />
                       </Form.Item>
                     </Col>
                     <Col xs={24} md={12}>
