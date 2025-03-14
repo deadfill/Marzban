@@ -196,6 +196,9 @@ export const Header: FC<HeaderProps> = ({ actions }) => {
                   {t("header.logout")}
                 </MenuItem>
               </Link>
+              <MenuItem as={Link} to="/messages/">
+                {t("messages.title")}
+              </MenuItem>
             </MenuList>
           </Menu>
 

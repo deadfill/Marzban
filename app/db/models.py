@@ -350,3 +350,16 @@ class NotificationReminder(Base):
     threshold = Column(Integer, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class MessageTask(Base):
+    __tablename__ = "message_tasks"
+
+    id = Column(Integer, primary_key=True)
+    task_type = Column(String(50), nullable=False)
+    cron_expression = Column(String(100), nullable=False)
+    message_text = Column(String(1000), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_run = Column(DateTime, nullable=True)
+    next_run = Column(DateTime, nullable=True)

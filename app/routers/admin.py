@@ -113,9 +113,15 @@ def remove_admin(
 
 
 @router.get("/admin", response_model=Admin)
-def get_current_admin(admin: Admin = Depends(Admin.get_current)):
-    """Retrieve the current authenticated admin."""
+def get_admin(admin: Admin = Depends(Admin.get_current)):
+    """Get current admin"""
     return admin
+
+
+@router.get("/admin/is-sudo")
+def is_sudo_admin(admin: Admin = Depends(Admin.check_sudo_admin)):
+    """Check if current admin is sudo"""
+    return {"is_sudo": True}
 
 
 @router.get(

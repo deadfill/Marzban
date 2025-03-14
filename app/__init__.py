@@ -20,8 +20,19 @@ app = FastAPI(
     redoc_url="/redoc" if DOCS else None,
 )
 
+# Настройка логирования для APScheduler (отключено для уменьшения вывода)
+logging.getLogger('apscheduler').setLevel(logging.WARNING)
+
 scheduler = BackgroundScheduler(
-    {"apscheduler.job_defaults.max_instances": 20}, timezone="UTC"
+    {
+        "apscheduler.job_defaults.max_instances": 50, 
+        "apscheduler.job_defaults.misfire_grace_time": 300,
+        "apscheduler.executors.default": {
+            "class": "apscheduler.executors.pool:ThreadPoolExecutor",
+            "max_workers": 20
+        }
+    }, 
+    timezone="UTC"
 )
 logger = logging.getLogger("uvicorn.error")
 

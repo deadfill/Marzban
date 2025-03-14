@@ -8,7 +8,7 @@ from . import (
     user_template, 
     user,
     home,
-    payment
+    message
 )
 
 api_router = APIRouter()
@@ -22,7 +22,7 @@ routers = [
     user_template.router,
     user.router,
     home.router,
-    payment.router,
+    message.router,
 ]
 
 for router in routers:

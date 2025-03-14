@@ -45,3 +45,4 @@ aiogram
 aiomysql
 marzban
 yookassa
+croniter==1.3.8

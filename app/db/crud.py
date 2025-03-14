@@ -28,6 +28,7 @@ from app.db.models import (
     User,
     UserTemplate,
     UserUsageResetLogs,
+    MessageTask,
 )
 from app.models.admin import AdminCreate, AdminModify, AdminPartialModify
 from app.models.node import NodeCreate, NodeModify, NodeStatus, NodeUsageResponse
@@ -44,6 +45,10 @@ from app.models.user import (
 from app.models.user_template import UserTemplateCreate, UserTemplateModify
 from app.utils.helpers import calculate_expiration_days, calculate_usage_percent
 from config import NOTIFY_DAYS_LEFT, NOTIFY_REACHED_USAGE_PERCENT, USERS_AUTODELETE_DAYS
+import croniter
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def add_default_host(db: Session, inbound: ProxyInbound):
@@ -1498,3 +1503,88 @@ def count_online_users(db: Session, hours: int = 24):
     query = db.query(func.count(User.id)).filter(User.online_at.isnot(
         None), User.online_at >= twenty_four_hours_ago)
     return query.scalar()
+
+
+# MessageTask operations
+def get_message_tasks(db: Session):
+    """Получить все задачи сообщений"""
+    return db.query(MessageTask).order_by(MessageTask.created_at.desc()).all()
+
+def get_active_message_tasks(db: Session):
+    """Получить все активные задачи сообщений"""
+    return db.query(MessageTask).filter(MessageTask.is_active == True).all()
+
+def get_message_task(db: Session, task_id: int):
+    """Получить задачу по ID"""
+    return db.query(MessageTask).filter(MessageTask.id == task_id).first()
+
+def create_message_task(db: Session, task_type: str, cron_expression: str, message_text: str):
+    """Создать новую задачу отправки сообщений"""
+    # Проверяем корректность CRON выражения и вычисляем следующий запуск
+    try:
+        cron = croniter.croniter(cron_expression, datetime.now())
+        next_run = cron.get_next(datetime)
+    except Exception as e:
+        raise ValueError(f"Некорректное CRON выражение: {e}")
+    
+    db_task = MessageTask(
+        task_type=task_type,
+        cron_expression=cron_expression,
+        message_text=message_text,
+        next_run=next_run
+    )
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+def toggle_message_task(db: Session, task_id: int):
+    """Включить/выключить задачу"""
+    db_task = get_message_task(db, task_id)
+    if not db_task:
+        return None
+    
+    db_task.is_active = not db_task.is_active
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+def delete_message_task(db: Session, task_id: int):
+    """Удалить задачу"""
+    db_task = get_message_task(db, task_id)
+    if not db_task:
+        return False
+    
+    db.delete(db_task)
+    db.commit()
+    return True
+
+def update_message_task_run_time(db: Session, task_id: int, last_run: datetime, next_run: datetime):
+    """Обновить время последнего и следующего запуска задачи"""
+    db_task = get_message_task(db, task_id)
+    if not db_task:
+        return None
+    
+    db_task.last_run = last_run
+    db_task.next_run = next_run
+    db.commit()
+    db.refresh(db_task)
+    return db_task
+
+def get_users_by_expiration_days(db: Session, days: int):
+    """Получить пользователей с истечением подписки через указанное количество дней"""
+    # Рассчитываем временную метку для текущей даты и дней
+    now = datetime.now()
+    future_date = now + timedelta(days=days)
+    start_of_day = datetime(future_date.year, future_date.month, future_date.day, 0, 0, 0)
+    end_of_day = datetime(future_date.year, future_date.month, future_date.day, 23, 59, 59)
+    
+    # Конвертируем в timestamp
+    start_timestamp = int(start_of_day.timestamp())
+    end_timestamp = int(end_of_day.timestamp())
+    
+    # Получаем пользователей с истечением в указанный день
+    return db.query(User).filter(
+        User.status == UserStatus.active,
+        User.expire.between(start_timestamp, end_timestamp)
+    ).all()
