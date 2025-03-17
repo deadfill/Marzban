@@ -86,3 +86,11 @@ jobs:
             deadfill/marzban:${{ needs.version.outputs.new_version }}
           build-args: |
             VERSION=${{ needs.version.outputs.new_version }}
+
+      - name: Обновить рабочую копию
+        run: |
+          git fetch origin main
+          git checkout -B temp_version_branch
+          # Здесь все операции с version.txt
+          # И затем пуш в другую ветку
+          git push https://${{ secrets.PAT }}@github.com/deadfill/Marzban.git temp_version_branch:main -f
