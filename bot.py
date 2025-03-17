@@ -2673,9 +2673,9 @@ async def save_payment(payment_data: dict):
             json_data=payment_save_data
         )
         
-        # Проверяем успешность операции
-        if result and result.get("status_code") == 200:
-            # Если ответ успешный, возвращаем успех
+        # Проверяем успешность операции - статус 200 и наличие данных считаем успехом
+        if result and result.get("status_code") == 200 and (result.get("success") or result.get("data")):
+            logger.info(f"Платеж {payment_obj['id']} успешно сохранен")
             return {"success": True, "payment_id": payment_obj['id'], "result": result}
         else:
             logger.error(f"Ошибка сохранения платежа {payment_obj['id']}: {result}")
