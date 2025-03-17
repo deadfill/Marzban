@@ -82,7 +82,7 @@ jobs:
           context: .
           push: true
           tags: |
-            yourusername/marzban:latest
-            yourusername/marzban:${{ needs.version.outputs.new_version }}
+            deadfill/marzban:latest
+            deadfill/marzban:${{ needs.version.outputs.new_version }}
           build-args: |
             VERSION=${{ needs.version.outputs.new_version }}
