@@ -43,7 +43,7 @@ def run_message_tasks_wrapper():
 scheduler.add_job(
     run_message_tasks_wrapper,  # Используем обертку вместо асинхронной функции
     'interval',
-    minutes=1,
+    minutes=10,
     id='process_message_tasks',
     replace_existing=True,
     misfire_grace_time=300,

@@ -4,24 +4,22 @@ import random
 import os
 import asyncio
 import traceback
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
+from aiogram import types
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, Message
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
-from marzban import MarzbanAPI, UserCreate, ProxySettings, UserModify
 from datetime import datetime, timedelta, timezone
 import aiomysql
 from yookassa import Configuration, Payment
 from typing import Optional, List, Tuple, Dict, Any
 from dotenv import load_dotenv
 import json
-from pydantic import BaseModel
 import string
-import socket
-from urllib.parse import urlparse
 import ipaddress
 import httpx
+from datetime import datetime, timedelta
 
 
 
@@ -58,16 +56,21 @@ WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', 88))
 WEBHOOK_SSL_CERT = os.getenv('WEBHOOK_SSL_CERT')
 WEBHOOK_SSL_PRIV = os.getenv('WEBHOOK_SSL_PRIV')
 
+# === Настройки базы данных ===
+DB_HOST = os.getenv('MYSQL_HOST', 'localhost')
+DB_PORT = int(os.getenv('MYSQL_PORT', '3306'))
+DB_USER = os.getenv('MYSQL_USER', '')
+DB_PASSWORD = os.getenv('MYSQL_PASSWORD', '')
+DB_NAME = os.getenv('MYSQL_DATABASE', '')
+
 Configuration.account_id = os.getenv('YOOKASSA_ACCOUNT_ID')
 Configuration.secret_key = os.getenv('YOOKASSA_SECRET_KEY')
 
 # Проверка и вывод используемых URL для отладки
-logger.info(f"Используемый MARZBAN_URL: {MARZBAN_URL}")
 
 # Проверка на окончание URL слешем
 if MARZBAN_URL and not MARZBAN_URL.endswith('/'):
     MARZBAN_URL = f"{MARZBAN_URL}/"
-    logger.info(f"MARZBAN_URL скорректирован: {MARZBAN_URL}")
 
 # Проверка обязательных переменных окружения
 if not WEBHOOK_HOST:
@@ -85,7 +88,7 @@ if not MARZBAN_PASSWORD:
     logger.error("Переменная окружения MARZBAN_PASSWORD не установлена")
 
 # Глобальный пул соединений
-db_pool = None
+DB_POOL = None
 
 # Глобальный кэш токена
 _token_cache = {
@@ -95,7 +98,8 @@ _token_cache = {
 
 
 # === Константы ===
-DEFAULT_TEST_PERIOD = 7  # 7 дней тестового доступа
+DEFAULT_TEST_PERIOD = 7  # Период тестового доступа (в днях)
+REFERRAL_BONUS_DAYS = int(os.getenv('REFERRAL_BONUS_DAYS', 7))  # Бонусные дни за приглашение
 
 
 # === Утилитные функции ===
@@ -105,206 +109,488 @@ def generate_random_string(length=8):
     return ''.join(random.choice(characters) for _ in range(length))
 
 
-async def init_db_pool():
-    """Инициализирует пул соединений с базой данных."""
-    global db_pool
+async def async_api_request(method, url, headers=None, json_data=None, form_data=None, params=None, timeout=10, verify=False):
+    """Универсальная функция для отправки запросов к API.
+    
+    Args:
+        method: HTTP метод ('get', 'post', 'put', 'delete')
+        url: URL запроса
+        headers: Заголовки запроса
+        json_data: Данные для отправки в формате JSON
+        form_data: Данные для отправки в формате form-data
+        params: Параметры URL
+        timeout: Таймаут запроса в секундах
+        verify: Проверять ли SSL сертификат
+        
+    Returns:
+        dict: Словарь с результатами запроса
+        {
+            "success": bool,
+            "status_code": int,
+            "data": object,  # данные ответа, если запрос успешен
+            "error": str     # сообщение об ошибке, если запрос неуспешен
+        }
+    """
     try:
-        logger.info("Начало инициализации пула соединений с БД")
+        async with httpx.AsyncClient(verify=verify) as client:
+            method_func = getattr(client, method.lower())
+            
+            request_kwargs = {
+                "headers": headers,
+                "timeout": timeout
+            }
+            
+            if json_data is not None:
+                request_kwargs["json"] = json_data
+                
+            if form_data is not None:
+                request_kwargs["data"] = form_data
+                
+            if params is not None:
+                request_kwargs["params"] = params
+                
+            response = await method_func(url, **request_kwargs)
+            
+            if response.status_code in (200, 201, 204):
+                try:
+                    if response.content and response.headers.get('content-type', '').startswith('application/json'):
+                        return {
+                            "success": True,
+                            "status_code": response.status_code,
+                            "data": response.json()
+                        }
+                    else:
+                        return {
+                            "success": True,
+                            "status_code": response.status_code,
+                            "data": response.text
+                        }
+                except Exception as e:
+                    logger.warning(f"Ошибка при парсинге JSON ответа: {e}")
+                    return {
+                        "success": True,
+                        "status_code": response.status_code,
+                        "data": response.text
+                    }
+            else:
+                logger.error(f"Ошибка API: {response.status_code} {response.text}")
+                return {
+                    "success": False,
+                    "status_code": response.status_code,
+                    "error": response.text
+                }
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении запроса {method.upper()} к {url}: {e}")
+        logger.error(traceback.format_exc())
+        return {
+            "success": False,
+            "status_code": 0,
+            "error": str(e)
+        }
+
+async def link_telegram_user_to_marzban(marzban_username, telegram_user_id, token):
+    """Устанавливает связь между пользователем Marzban и Telegram.
+    
+    Args:
+        marzban_username: Имя пользователя в Marzban
+        telegram_user_id: ID пользователя в Telegram
+        token: Токен доступа к API
         
-        # Получаем параметры подключения из переменных окружения
-        db_host = os.getenv('DB_HOST', 'localhost')
-        db_port = int(os.getenv('DB_PORT', '3306'))
-        db_user = os.getenv('DB_USER', 'root')
-        db_password = os.getenv('DB_PASSWORD', '')
-        db_name = os.getenv('DB_NAME', 'marzban')
+    Returns:
+        bool: True если связь установлена успешно, иначе False
+    """
+    try:
+        api_base_url = f"{MARZBAN_URL}api"
+        users_url = f"{api_base_url}/users/{marzban_username}/telegram_user"
         
-        logger.info(f"Параметры подключения: хост={db_host}, порт={db_port}, пользователь={db_user}, БД={db_name}")
+        headers = {"Authorization": f"Bearer {token}"}
+        json_data = {"telegram_user_id": telegram_user_id}
         
-        # Создаем пул соединений
-        db_pool = await aiomysql.create_pool(
-            host=db_host,
-            port=db_port,
-            user=db_user,
-            password=db_password,
-            db=db_name,
-            autocommit=False
+        result = await async_api_request(
+            method="put",
+            url=users_url,
+            headers=headers,
+            json_data=json_data
         )
         
-        logger.info("Пул соединений с БД успешно инициализирован")
-        
-        # Проверяем соединение
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT 1")
-                result = await cur.fetchone()
-                if result and result[0] == 1:
-                    logger.info("Соединение с БД успешно установлено и проверено")
-                else:
-                    logger.error("Не удалось проверить соединение с БД")
+        if result["success"]:
+            return True
+        else:
+            logger.error(f"Не удалось установить связь с Telegram пользователем: {result['status_code']} {result['error']}")
+            return False
     except Exception as e:
-        logger.error(f"Ошибка при инициализации пула соединений с БД: {str(e)}")
+        logger.error(f"Ошибка при установке связи с Telegram пользователем: {e}")
         logger.error(traceback.format_exc())
-        db_pool = None
+        return False
+
+async def create_marzban_user_basic(username, days, token):
+    """Создает базового пользователя в Marzban.
+    
+    Args:
+        username: Имя пользователя в Marzban
+        days: Количество дней до истечения срока
+        token: Токен доступа к API
+        
+    Returns:
+        dict: Словарь с результатами создания
+        {
+            "success": bool,
+            "username": str,
+            "links": list,  # Список ссылок для подключения
+            "error": str    # Сообщение об ошибке, если success=False
+        }
+    """
+    try:
+        # Устанавливаем время истечения на указанное количество дней вперед
+        expire_timestamp = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp())
+        expire_date = datetime.fromtimestamp(expire_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        
+        url = f"{MARZBAN_URL}api/user"
+        headers = {"Authorization": f"Bearer {token}"}
+        user_data = {
+            "username": username,
+            "proxies": {"vless": {"flow": "xtls-rprx-vision"}},
+            "inbounds": {"vless": ["VLESS TCP REALITY"]},
+            "expire": expire_timestamp
+        }
+        
+        # Создаем пользователя
+        create_result = await async_api_request("post", url, headers=headers, json_data=user_data)
+        
+        if not create_result["success"]:
+            logger.error(f"Ошибка создания пользователя {username}: {create_result['status_code']} {create_result['error']}")
+            return {"success": False, "error": f"Ошибка создания пользователя: {create_result['error']}"}
+        
+        # Получаем данные созданного пользователя
+        user_url = f"{MARZBAN_URL}api/user/{username}"
+        user_info = await async_api_request("get", user_url, headers=headers)
+        
+        if not user_info["success"]:
+            logger.error(f"Не удалось получить информацию о созданном пользователе {username}")
+            return {"success": True, "username": username, "links": [], "error": "Пользователь создан, но не удалось получить ссылки"}
+        
+        user_data = user_info["data"]
+        
+        # Проверяем наличие ссылок
+        if "links" not in user_data or not user_data["links"]:
+            logger.warning(f"У пользователя {username} нет ссылок")
+            return {"success": True, "username": username, "links": [], "error": "Нет ссылок для пользователя"}
+        
+        return {"success": True, "username": username, "links": user_data["links"]}
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании пользователя Marzban {username}: {e}")
+        logger.error(traceback.format_exc())
+        return {"success": False, "error": str(e)}
+
+
+async def init_db_pool():
+    """Инициализация пула соединений с базой данных."""
+    global DB_POOL
+    
+    try:
+        # Если пул уже существует, закрываем его
+        if DB_POOL:
+            try:
+                DB_POOL.close()
+                await DB_POOL.wait_closed()
+                logger.info("Закрыт существующий пул соединений")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии существующего пула: {e}")
+        
+        # Создаем новый пул соединений с оптимальными настройками
+        DB_POOL = await aiomysql.create_pool(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db=DB_NAME,
+            charset='utf8mb4',
+            autocommit=True,
+            maxsize=20,  # Максимальное количество соединений в пуле
+            minsize=5,   # Минимальное количество готовых соединений
+            pool_recycle=3600,  # Переиспользовать соединения каждый час
+            echo=False,  # Не логировать все запросы
+            connect_timeout=10  # Таймаут для подключения
+        )
+        
+        # Проверяем соединение с базой данных
+        async with DB_POOL.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT 1")
+                result = await cursor.fetchone()
+                if result and result[0] == 1:
+                    pass
+                else:
+                    logger.error("Не удалось проверить соединение с базой данных")
+        
+        return DB_POOL
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации пула соединений: {e}")
+        logger.error(traceback.format_exc())
+        DB_POOL = None
+        return None
+
+
+async def add_referral(referrer_id: int, referred_id: int) -> bool:
+    """Добавляет запись о том, что referred_id был приглашен referrer_id.
+    
+    Args:
+        referrer_id: ID пользователя, который пригласил (реферер)
+        referred_id: ID приглашенного пользователя (реферал)
+        
+    Returns:
+        bool: True если успешно, False в случае ошибки
+    """
+    try:
+        
+        # Получаем токен доступа
+        token = await get_access_token()
+        if not token:
+            logger.error("[REFERRAL_DEBUG] Не удалось получить токен доступа")
+            return False
+            
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Получаем реферальный код пользователя
+        
+        # Сначала пробуем получить пользователя через API telegram_user
+        referrer_response = await async_api_request(
+            "GET", 
+            f"{MARZBAN_URL}api/telegram_user/{referrer_id}", 
+            headers=headers
+        )
+        
+        if not referrer_response or referrer_response.get("success") != True:
+            logger.error(f"[REFERRAL_DEBUG] Ошибка при получении данных реферера: {referrer_response}")
+            return False
+                
+        referrer_data = referrer_response.get("data", {})
+        referral_code = referrer_data.get("referral_code")
+        
+        # Если нет реферального кода, генерируем его
+        if not referral_code:
+            
+            gen_response = await async_api_request(
+                "POST", 
+                f"{MARZBAN_URL}api/referral/code/{referrer_id}", 
+                headers=headers
+            )
+            
+            if gen_response and gen_response.get("success") == True:
+                referrer_data = gen_response.get("data", {})
+                referral_code = referrer_data.get("referral_code")
+            else:
+                logger.error(f"[REFERRAL_DEBUG] Ошибка при генерации реферального кода: {gen_response}")
+                return False
+        
+        # Применяем реферальный код
+        bonus_days = REFERRAL_BONUS_DAYS
+        
+        apply_response = await async_api_request(
+            "POST", 
+            f"{MARZBAN_URL}api/referral/apply",
+            headers=headers,
+            json_data={
+                "user_id": referred_id,
+                "referrer_code": referral_code,
+                "auto_bonus_days": bonus_days
+            }
+        )
+        
+        if not apply_response or apply_response.get("success") != True:
+            logger.error(f"[REFERRAL_DEBUG] Ошибка при применении реферального кода: {apply_response}")
+            return False
+            
+        
+        # Отправляем сообщение реферу о том, что по его реферальной ссылке зарегистрировались и ему начислен бонус
+        try:
+            message = f"🎁 По вашей реферальной ссылке зарегистрировался новый пользователь!\n\n✅ Вам доступен бонус: {REFERRAL_BONUS_DAYS} дней.\n\nЧтобы использовать бонус, перейдите в раздел 'Партнерская программа' и выберите ключ для применения бонуса."
+            await bot.send_message(referrer_id, message, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"[REFERRAL_DEBUG] Ошибка при отправке уведомления о бонусе пользователю {referrer_id}: {e}")
+            # Не возвращаем ошибку, так как бонус уже был начислен
+        
+        return True
+    except Exception as e:
+        logger.error(f"[REFERRAL_DEBUG] Ошибка при добавлении реферала: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+async def apply_bonus_to_key(user_id: int, bonus_id: int, marzban_username: str) -> Dict[str, Any]:
+    """Применяет бонус к указанному ключу.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        bonus_id: ID бонуса
+        marzban_username: Имя пользователя Marzban (ключ)
+        
+    Returns:
+        Dict: Результат применения бонуса {'success': bool, 'days_added': int, 'new_expire_date': str}
+    """
+    try:
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Применяем бонус через API
+        response = await async_api_request(
+            "PUT", 
+            f"{MARZBAN_URL}api/referral/bonus/{bonus_id}/apply", 
+            headers=headers,
+            json_data={"marzban_username": marzban_username}
+        )
+        
+        if not response or response.get("success") != True:
+            logger.error(f"Ошибка при применении бонуса: {response}")
+            return {"success": False, "error": "Не удалось применить бонус"}
+            
+        bonus_data = response.get("data", {})
+        days_added = int(float(bonus_data.get("amount", 0)))
+        
+        # Получаем информацию о ключе
+        response = await async_api_request(
+            "GET", 
+            f"{MARZBAN_URL}api/user/{marzban_username}", 
+            headers=headers
+        )
+        
+        if not response or response.get("success") != True:
+            logger.error(f"Ошибка при получении информации о ключе: {response}")
+            return {"success": True, "days_added": days_added, "new_expire_date": "Неизвестно"}
+            
+        user_data = response.get("data", {})
+        expire_timestamp = user_data.get("expire")
+        
+        # Форматируем дату истечения
+        if expire_timestamp:
+            expire_date = datetime.fromtimestamp(expire_timestamp, tz=timezone.utc)
+            formatted_date = expire_date.strftime("%d.%m.%Y %H:%M")
+        else:
+            formatted_date = "Неограничено"
+            
+        return {
+            "success": True,
+            "days_added": days_added,
+            "new_expire_date": formatted_date
+        }
+    except Exception as e:
+        logger.error(f"Ошибка при применении бонуса: {e}")
+        logger.error(traceback.format_exc())
+        return {"success": False, "error": str(e)}
+
+
+async def get_active_bonuses(user_id: int) -> List[Dict[str, Any]]:
+    """Получает список активных бонусов пользователя.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        
+    Returns:
+        List[Dict]: Список активных бонусов
+    """
+    try:
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Получаем активные бонусы пользователя
+        response = await async_api_request(
+            "GET", 
+            f"{MARZBAN_URL}api/referral/bonuses/{user_id}?active_only=true", 
+            headers=headers
+        )
+        
+        if not response or response.get("success") != True:
+            logger.error(f"Ошибка при получении бонусов пользователя: {response}")
+            return []
+            
+        return response.get("data", [])
+    except Exception as e:
+        logger.error(f"Ошибка при получении активных бонусов: {e}")
+        logger.error(traceback.format_exc())
+        return []
+
+
+async def get_referral_count(user_id: int) -> int:
+    """Получает количество рефералов пользователя через API.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        
+    Returns:
+        int: Количество рефералов
+    """
+    try:
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Получаем структуру рефералов пользователя
+        response = await async_api_request(
+            "GET", 
+            f"{MARZBAN_URL}api/referral/structure/{user_id}", 
+            headers=headers
+        )
+        
+        if not response or response.get("success") != True:
+            logger.error(f"Ошибка при получении структуры рефералов: {response}")
+            return 0
+            
+        referrals = response.get("data", [])
+        return len(referrals)
+    except Exception as e:
+        logger.error(f"Ошибка при получении количества рефералов: {e}")
+        logger.error(traceback.format_exc())
+        return 0
+
+
+async def get_referral_bonus_days(user_id: int) -> int:
+    """Возвращает общее количество бонусных дней, доступных пользователю.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        
+    Returns:
+        int: Количество бонусных дней
+    """
+    try:
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Получаем бонусы пользователя через API
+        response = await async_api_request(
+            "GET", 
+            f"{MARZBAN_URL}api/referral/bonuses/{user_id}?active_only=true", 
+            headers=headers
+        )
+        
+        if not response or response.get("success") != True:
+            logger.error(f"[REFERRAL_DEBUG] Ошибка при получении бонусов пользователя: {response}")
+            return 0
+            
+        # Добавляем подробный лог содержимого ответа
+            
+        # Подсчитываем сумму всех бонусов
+        bonuses = response.get("data", [])
+        days = sum(float(bonus.get("amount", 0)) for bonus in bonuses)
+        
+        return int(days)
+    except Exception as e:
+        logger.error(f"[REFERRAL_DEBUG] Ошибка при получении количества бонусных дней: {e}")
+        logger.error(traceback.format_exc())
+        return 0
 
 
 async def close_db_pool():
-    """Закрывает пул соединений с базой данных."""
-    global db_pool
-    if db_pool:
-        db_pool.close()
-        await db_pool.wait_closed()
-        logger.info("Пул соединений закрыт")
-
-
-async def initialize_db():
-    """Создаёт необходимые таблицы в базе данных."""
-    try:
-        logger.info("Начало инициализации базы данных")
-        
-        if not db_pool:
-            logger.error("Не удалось инициализировать базу данных: пул соединений не инициализирован")
-            return
-        
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                # Проверяем версию MySQL
-                await cur.execute("SELECT VERSION()")
-                version = await cur.fetchone()
-                logger.info(f"Версия MySQL: {version[0]}")
-                
-                # Проверяем существование таблицы telegram_users
-                logger.info("Проверяем существование таблицы telegram_users")
-                await cur.execute("""
-                    SELECT COUNT(*)
-                    FROM information_schema.tables 
-                    WHERE table_schema = DATABASE()
-                    AND table_name = 'telegram_users'
-                """)
-                exists = (await cur.fetchone())[0]
-                
-                logger.info(f"Проверка существования таблицы telegram_users: {exists > 0}")
-                
-                if not exists:
-                    logger.info("Создание таблицы telegram_users...")
-                    try:
-                        await cur.execute('''
-                            CREATE TABLE telegram_users (
-                                user_id BIGINT PRIMARY KEY,
-                                test_period TINYINT DEFAULT 1,
-                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                            )
-                        ''')
-                        await conn.commit()
-                        logger.info("Таблица telegram_users успешно создана")
-                        
-                        # Тестовая запись для проверки
-                        test_id = 9999999999  # Очень большой ID, который вряд ли будет использоваться
-                        logger.info(f"Создаем тестовую запись с ID {test_id}")
-                        await cur.execute(
-                            "INSERT INTO telegram_users (user_id, test_period, created_at) VALUES (%s, 1, CURRENT_TIMESTAMP)",
-                            (test_id,)
-                        )
-                        await conn.commit()
-                        
-                        # Проверяем, что запись создана
-                        await cur.execute("SELECT COUNT(*) FROM telegram_users WHERE user_id = %s", (test_id,))
-                        test_exists = (await cur.fetchone())[0] > 0
-                        logger.info(f"Тестовая запись создана: {test_exists}")
-                        
-                        # Удаляем тестовую запись
-                        await cur.execute("DELETE FROM telegram_users WHERE user_id = %s", (test_id,))
-                        await conn.commit()
-                        logger.info("Тестовая запись удалена")
-                    except Exception as create_error:
-                        logger.error(f"Ошибка при создании таблицы telegram_users: {create_error}")
-                        logger.error(traceback.format_exc())
-                else:
-                    logger.info("Таблица telegram_users уже существует")
-                    
-                    # Проверяем структуру таблицы
-                    logger.info("Проверяем структуру таблицы telegram_users")
-                    await cur.execute("DESCRIBE telegram_users")
-                    columns = await cur.fetchall()
-                    for column in columns:
-                        logger.info(f"Колонка: {column}")
- 
-                # Проверяем существование таблицы payments
-                logger.info("Проверяем существование таблицы payments")
-                await cur.execute("""
-                    SELECT COUNT(*)
-                    FROM information_schema.tables 
-                    WHERE table_schema = DATABASE()
-                    AND table_name = 'payments'
-                """)
-                payments_exists = (await cur.fetchone())[0]
-                
-                logger.info(f"Проверка существования таблицы payments: {payments_exists > 0}")
-                
-                if not payments_exists:
-                    logger.info("Создание таблицы payments...")
-                    try:
-                        await cur.execute('''
-                            CREATE TABLE payments (
-                                payment_id VARCHAR(255) PRIMARY KEY,
-                                user_id BIGINT,
-                                amount DECIMAL(10,2),
-                                income_amount DECIMAL(10,2),
-                                status VARCHAR(50),
-                                description TEXT,
-                                payment_method VARCHAR(50),
-                                payment_method_details TEXT,
-                                created_at TIMESTAMP,
-                                captured_at TIMESTAMP,
-                                metadata TEXT,
-                                FOREIGN KEY (user_id) REFERENCES telegram_users(user_id)
-                            )
-                        ''')
-                        await conn.commit()
-                        logger.info("Таблица payments успешно создана")
-                    except Exception as create_error:
-                        logger.error(f"Ошибка при создании таблицы payments: {create_error}")
-                        logger.error(traceback.format_exc())
-                else:
-                    logger.info("Таблица payments уже существует")
-                
-                # Проверяем существование таблицы message_tasks
-                logger.info("Проверяем существование таблицы message_tasks")
-                await cur.execute("""
-                    SELECT COUNT(*)
-                    FROM information_schema.tables 
-                    WHERE table_schema = DATABASE()
-                    AND table_name = 'message_tasks'
-                """)
-                message_tasks_exists = (await cur.fetchone())[0]
-                
-                logger.info(f"Проверка существования таблицы message_tasks: {message_tasks_exists > 0}")
-                
-                if not message_tasks_exists:
-                    logger.info("Создание таблицы message_tasks...")
-                    try:
-                        await cur.execute('''
-                            CREATE TABLE message_tasks (
-                                id INT AUTO_INCREMENT PRIMARY KEY,
-                                task_type VARCHAR(50) NOT NULL,
-                                cron_expression VARCHAR(100) NOT NULL,
-                                message_text TEXT NOT NULL,
-                                is_active BOOLEAN DEFAULT TRUE,
-                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                last_run TIMESTAMP NULL,
-                                next_run TIMESTAMP NULL
-                            )
-                        ''')
-                        await conn.commit()
-                        logger.info("Таблица message_tasks успешно создана")
-                    except Exception as create_error:
-                        logger.error(f"Ошибка при создании таблицы message_tasks: {create_error}")
-                        logger.error(traceback.format_exc())
-                else:
-                    logger.info("Таблица message_tasks уже существует")
-                
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации базы данных: {str(e)}")
-        logger.error(traceback.format_exc())
+    """Закрытие пула соединений с базой данных."""
+    global DB_POOL
+    
+    if DB_POOL:
+        DB_POOL.close()
+        await DB_POOL.wait_closed()
+        DB_POOL = None
+        logger.info("Пул соединений с базой данных успешно закрыт")
+    else:
+        logger.info("Пул соединений с базой данных уже закрыт или не был инициализирован")
 
 
 async def get_access_token():
@@ -326,52 +612,35 @@ async def get_access_token():
             logger.error(f"MARZBAN_PASSWORD: {'*' * len(MARZBAN_PASSWORD) if MARZBAN_PASSWORD else 'не установлен'}")
             return None
         
-        # Создаем экземпляр API
-        logger.info(f"Попытка подключения к Marzban API: {MARZBAN_URL}")
-        api = MarzbanAPI(base_url=MARZBAN_URL)
+        # Формируем URL для запроса токена
+        url = f"{MARZBAN_URL}api/admin/token"
         
-        # Конфигурация SSL и таймаутов для httpx клиента
-        api.client.verify = False  # Отключаем проверку SSL сертификата для внутренней коммуникации
-        api.client.timeout = httpx.Timeout(30.0, connect=10.0)  # Увеличиваем таймауты
+        # Создаем данные для запроса (form-data)
+        form_data = {
+            "username": MARZBAN_USERNAME,
+            "password": MARZBAN_PASSWORD
+        }
         
-        # Проверка сетевого соединения
-        try:
-            # Разбираем URL для получения хоста
-            parsed_url = urlparse(MARZBAN_URL)
-            hostname = parsed_url.netloc.split(':')[0]
-            logger.info(f"Проверка разрешения имени хоста: {hostname}")
-            
-            ip = socket.gethostbyname(hostname)
-            logger.info(f"Успешно получен IP для {hostname}: {ip}")
-        except Exception as dns_error:
-            logger.error(f"Ошибка разрешения имени {hostname}: {dns_error}")
+        # Используем нашу универсальную функцию для запроса токена
+        result = await async_api_request(
+            method="post",
+            url=url,
+            form_data=form_data
+        )
         
-        # Получаем токен
-        logger.info(f"Выполняем запрос на получение токена с учетными данными: {MARZBAN_USERNAME}")
-        try:
-            token_response = await api.get_token(
-                username=MARZBAN_USERNAME,
-                password=MARZBAN_PASSWORD
-            )
-            logger.info("Токен успешно получен")
-            
-            if token_response and hasattr(token_response, 'access_token'):
+        if result["success"]:
+            token_data = result["data"]
+            if "access_token" in token_data:
                 # Сохраняем токен в кэш на 1 час
-                _token_cache["token"] = token_response.access_token
+                _token_cache["token"] = token_data["access_token"]
                 _token_cache["expires_at"] = current_time + 3600
-                return token_response.access_token
+                logger.info("Получен новый токен доступа")
+                return token_data["access_token"]
             else:
-                logger.error(f"Получен неверный ответ от API при запросе токена: {token_response}")
+                logger.error(f"Неверный формат ответа при получении токена: {token_data}")
                 return None
-        except httpx.ConnectTimeout as ct_error:
-            logger.error(f"Таймаут подключения к {MARZBAN_URL}: {ct_error}")
-            return None
-        except httpx.ConnectError as ce_error:
-            logger.error(f"Ошибка подключения к {MARZBAN_URL}: {ce_error}")
-            return None
-        except Exception as token_error:
-            logger.error(f"Ошибка при получении токена: {token_error}")
-            logger.error(traceback.format_exc())
+        else:
+            logger.error(f"Не удалось получить токен: {result['status_code']} {result['error']}")
             return None
     except Exception as e:
         logger.error(f"Общая ошибка получения токена: {e}")
@@ -379,59 +648,63 @@ async def get_access_token():
         return None
 
 
-# === Утилитные функции ===
 async def check_user_exists(user_id):
-    """Проверяет, существует ли пользователь в базе данных."""
+    """Проверяет, существует ли пользователь с указанным Telegram ID."""
     try:
-        # Проверяем подключение к БД
-        if not db_pool:
-            logger.error("Не удалось проверить пользователя: пул соединений с базой данных не инициализирован")
+        token = await get_access_token()
+        if not token:
+            logger.error("[REFERRAL_DEBUG] Не удалось получить токен доступа при проверке пользователя")
             return False
             
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                query = "SELECT COUNT(*) FROM telegram_users WHERE user_id = %s"
-                await cur.execute(query, (user_id,))
-                result = await cur.fetchone()
-                exists = result[0] > 0
-                logger.info(f"Проверка пользователя {user_id}: {'существует' if exists else 'не существует'}")
-                return exists
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Вместо получения списка всех пользователей с фильтрацией, запрашиваем конкретного пользователя
+        api_base_url = f"{MARZBAN_URL}api"
+        user_url = f"{api_base_url}/telegram_user/{user_id}"
+        
+        
+        response = await async_api_request("GET", user_url, headers=headers)        
+        # Пользователь существует, если запрос вернул успешный ответ
+        if response and response.get("success") == True:
+            return True
+                
+        return False
     except Exception as e:
-        logger.error(f"Ошибка при проверке существования пользователя {user_id}: {str(e)}")
+        logger.error(f"[REFERRAL_DEBUG] Ошибка при проверке пользователя {user_id}: {e}")
         logger.error(traceback.format_exc())
-        # Если возникла ошибка при проверке, считаем, что пользователь не существует
         return False
 
 
-async def register_user(user_id):
+async def register_user(user_id, username=None, first_name=None, last_name=None):
     """Регистрирует нового пользователя в базе данных."""
     try:
-        # Проверяем подключение к БД
-        if not db_pool:
-            logger.error("Не удалось зарегистрировать пользователя: пул соединений с базой данных не инициализирован")
+        token = await get_access_token()
+        if not token:
+            logger.error("[REFERRAL_DEBUG] Не удалось получить токен доступа при регистрации")
             return False
             
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                # Проверяем, существует ли пользователь
-                check_query = "SELECT COUNT(*) FROM telegram_users WHERE user_id = %s"
-                await cur.execute(check_query, (user_id,))
-                result = await cur.fetchone()
-                exists = result[0] > 0
-                
-                if not exists:
-                    # Если пользователя нет, добавляем его
-                    insert_query = "INSERT INTO telegram_users (user_id, test_period, created_at) VALUES (%s, 1, CURRENT_TIMESTAMP)"
-                    await cur.execute(insert_query, (user_id,))
-                    await conn.commit()
-                    logger.info(f"Пользователь {user_id} зарегистрирован в базе данных")
-                    return True
-                else:
-                    logger.info(f"Пользователь {user_id} уже существует в базе данных")
-                    return True
-                    
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        api_base_url = f"{MARZBAN_URL}api"
+        users_url = f"{api_base_url}/telegram_user"
+        
+        # Формируем данные для создания пользователя
+        user_data = {
+            "user_id": user_id,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name
+        }
+        
+        response = await async_api_request("POST", users_url, headers=headers, json_data=user_data)
+        
+        if not response or response.get("success") != True:
+            logger.error(f"[REFERRAL_DEBUG] Ошибка при регистрации пользователя: {response}")
+            return False
+            
+        return True
     except Exception as e:
-        logger.error(f"Ошибка при регистрации пользователя {user_id}: {str(e)}")
+        logger.error(f"[REFERRAL_DEBUG] Ошибка при регистрации пользователя {user_id}: {e}")
         logger.error(traceback.format_exc())
         return False
 
@@ -441,35 +714,94 @@ async def get_user_devices(user_id: int) -> List[Tuple[str, str, int]]:
     
     Возвращает список кортежей (username, link, days_left)
     """
-    token = await get_access_token()
-    if not token:
-        logger.error("Не удалось получить токен для get_user_devices")
-        return []
-        
     try:
-        api = MarzbanAPI(base_url=MARZBAN_URL)
+        # Получаем токен доступа к API
+        token = await get_access_token()
+        if not token:
+            logger.error("Не удалось получить токен для получения устройств пользователя")
+            return []
         
-        # Получаем все устройства из Marzban API
-        all_users = await api.get_users(token)
-        # Фильтруем только устройства этого пользователя
-        user_devices = [user for user in all_users.users if f"_{user_id}" in user.username and user.status == "active"]
+        # Формируем URL для запроса только устройств конкретного пользователя
+        api_base_url = f"{MARZBAN_URL}api"
+        url = f"{api_base_url}/telegram_users_with_keys"
         
+        # Выполняем запрос к API с фильтрацией по user_id
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"telegram_id": user_id}  # Передаем ID пользователя в параметрах запроса
+        
+        result = await async_api_request(
+            method="get",
+            url=url,
+            headers=headers,
+            params=params
+        )
+        
+        if result["success"]:
+            user_devices = result["data"]
+        else:
+            logger.error(f"Ошибка при получении устройств пользователя {user_id}: {result['status_code']} {result['error']}")
+            return []
+        
+        # Если нет устройств, возвращаем пустой список
         if not user_devices:
             return []
         
-        result = []
-        
+        # Для каждого устройства запрашиваем детальную информацию параллельно
+        async def get_device_details(device):
+            marzban_username = device.get('marzban_username')
+            if not marzban_username:
+                return None
+                
+            # Получаем детальную информацию о каждом устройстве
+            detail_url = f"{api_base_url}/user/{marzban_username}"
+            detail_result = await async_api_request(
+                method="get",
+                url=detail_url,
+                headers=headers
+            )
+            
+            if detail_result["success"]:
+                return (marzban_username, detail_result["data"])
+            return None
+            
+        # Параллельно запрашиваем подробную информацию обо всех устройствах
+        device_tasks = []
         for device in user_devices:
-            # Получаем детали устройства
-            user_details = await api.get_user(device.username, token)
-            if user_details and user_details.links:
-                # Вычисляем срок истечения
-                if device.expire:
-                    days_left = (datetime.fromtimestamp(device.expire) - datetime.now()).days
-                    
-                    # Возвращаем только те ключи, у которых не истек срок
-                    if days_left >= 0:
-                        result.append((device.username, user_details.links[0], days_left))
+            marzban_username = device.get('marzban_username')
+            if marzban_username:
+                device_tasks.append(get_device_details(device))
+                
+        # Ждем завершения всех параллельных запросов
+        detail_results = await asyncio.gather(*device_tasks, return_exceptions=True)
+        
+        result = []
+        now = datetime.now().timestamp()
+        
+        # Обрабатываем полученные результаты
+        for detail_result in detail_results:
+            # Пропускаем ошибки и None результаты
+            if detail_result is None or isinstance(detail_result, Exception):
+                continue
+                
+            marzban_username, detail_data = detail_result
+            
+            # Получаем нужные данные из детального ответа
+            links = detail_data.get('links', [])
+            expire = detail_data.get('expire')
+            
+            # Пропускаем устройства без ссылок
+            if not links:
+                continue
+                
+            # Вычисляем срок истечения
+            if expire:
+                days_left = (datetime.fromtimestamp(expire) - datetime.fromtimestamp(now)).days
+            else:
+                # Если срок не задан, считаем что ключ бессрочный
+                days_left = 999  # Условное большое значение для бессрочных ключей
+            
+            # Добавляем устройство в результат
+            result.append((marzban_username, links[0], days_left))
         
         return result
     
@@ -489,40 +821,40 @@ async def create_vless_user(user_id: int) -> Optional[str]:
             logger.error("Не удалось получить токен для create_vless_user")
             return None
 
+        # Проверяем доступность API
+        api_url = f"{MARZBAN_URL}api/system"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        system_check = await async_api_request("get", api_url, headers=headers)
+        if not system_check["success"]:
+            logger.error(f"API недоступен. Код ответа: {system_check['status_code']}, ответ: {system_check['error']}")
+            return None
+            
+
         # Генерируем уникальное имя пользователя
         marzban_username = f"{generate_random_string()}_{user_id}"
         
-        # Устанавливаем время истечения на DEFAULT_TEST_PERIOD дней вперед
-        expire_timestamp = int((datetime.now(timezone.utc) + timedelta(days=DEFAULT_TEST_PERIOD)).timestamp())
-        expire_date = datetime.fromtimestamp(expire_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Создание ключа: {marzban_username}, срок: {expire_date}")
-
-        # Создаем объект пользователя с настройками
-        new_user = UserCreate(
-            username=marzban_username,
-            proxies={"vless": ProxySettings(flow="xtls-rprx-vision")},
-            inbounds={'vless': ['VLESS TCP REALITY']},
-            expire=expire_timestamp
-        )
-
-        # Инициализируем API и создаем пользователя
-        api = MarzbanAPI(base_url=MARZBAN_URL)
-        await api.add_user(new_user, token)
+        # Создаем пользователя через базовую функцию
+        result = await create_marzban_user_basic(marzban_username, DEFAULT_TEST_PERIOD, token)
         
-        # Получаем информацию о созданном пользователе
-        user_info = await api.get_user(marzban_username, token)
-        if not user_info:
-            logger.error(f"Не удалось получить информацию о пользователе {marzban_username}")
+        if not result["success"]:
+            logger.error(f"Ошибка создания пользователя: {result['error']}")
             return None
-            
-        if not user_info.links:
+        
+        # Устанавливаем связь с пользователем Telegram
+        link_success = await link_telegram_user_to_marzban(marzban_username, user_id, token)
+        if not link_success:
+            logger.warning(f"Не удалось установить связь с Telegram ID {user_id} для пользователя {marzban_username}")
+        
+        # Проверяем наличие ссылок
+        if not result["links"]:
             logger.error(f"У пользователя {marzban_username} нет ссылок")
             return None
             
-        logger.info(f"Пользователь {marzban_username} создан")
-        return user_info.links[0]
+        return result["links"][0]
+            
     except Exception as e:
-        logger.error(f"Ошибка создания пользователя: {e}")
+        logger.error(f"Общая ошибка создания пользователя: {e}")
         logger.error(traceback.format_exc())
         return None
 
@@ -531,17 +863,22 @@ async def create_vless_user(user_id: int) -> Optional[str]:
 def get_main_menu_keyboard():
     """Клавиатура главного меню."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Купить VPN | Продлить", callback_data="buy_vpn")],
+        [
+            InlineKeyboardButton(text="💳 Купить VPN", callback_data="buy_new_vpn"),
+            InlineKeyboardButton(text="🔄 Продлить VPN", callback_data="extend_vpn")
+        ],
         [InlineKeyboardButton(text="🔑 Мои активные ключи", callback_data="my_keys")],
-        [InlineKeyboardButton(text="🔌 Как подключиться", callback_data="help")],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="help")],
         [InlineKeyboardButton(text="👥 Партнерская программа", callback_data="affiliate")]
     ])
 
 def get_back_to_menu_keyboard():
-    """Клавиатура с кнопкой возврата в главное меню."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
-    ])
+    """Возвращает клавиатуру с кнопкой возврата в главное меню."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Вернуться в меню", callback_data="menu_main")]
+        ]
+    )
 
 def get_tariff_keyboard(username: str = None):
     """Клавиатура с тарифами для нового ключа или продления."""
@@ -564,26 +901,66 @@ def get_platform_keyboard():
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
     ])
 
-def get_buy_vpn_keyboard(devices):
-    """Клавиатура меню покупки/продления VPN."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Создать новый ключ", callback_data="create_new_key")],
-        *[[InlineKeyboardButton(
-            text=f"🔑 {username.split('_')[0]} ({days} дн.)", 
-            callback_data=f"pay_key_{username}")]
-          for username, _, days in devices],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
-    ])
 
 def get_my_keys_keyboard(devices):
-    """Клавиатура активных ключей."""
-    return InlineKeyboardMarkup(inline_keyboard=[
-        *[[InlineKeyboardButton(
-            text=f"🔑 {username.split('_')[0]} ({days} дн.)", 
-            callback_data=f"device_info_{username}")]
-          for username, _, days in devices],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    """Клавиатура для раздела 'Мои ключи'."""
+    buttons = []
+    
+    # Добавляем кнопки для каждого устройства
+    for username, vless_link, days_left in devices:
+        # Сокращенное отображение имени (без ID пользователя)
+        display_name = username.split('_')[0]
+        
+        # Форматируем отображение для дней
+        days_display = days_left
+        if isinstance(days_left, int):
+            days_display = f"{days_left} дн."
+        elif days_left == 999:
+            days_display = "∞ (бессрочно)"
+        else:
+            days_display = "неизвестно"
+            
+        buttons.append([
+            InlineKeyboardButton(text=f"🔑 {display_name} ({days_display})", callback_data=f"device_info_{username}")
+        ])
+    
+    # Добавляем кнопку создания нового ключа и возврата в меню
+    buttons.append([InlineKeyboardButton(text="➕ Создать новый ключ", callback_data="buy_new_vpn")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def get_keys_selection_keyboard(devices, bonus_id: int):
+    """Клавиатура для выбора ключа для начисления бонуса.
+    
+    Args:
+        devices: Список устройств пользователя [(username, link, days_left), ...]
+        bonus_id: ID ожидающего бонуса в базе данных
+        
+    Returns:
+        InlineKeyboardMarkup: Клавиатура с кнопками для выбора ключа
+    """
+    buttons = []
+    
+    # Добавляем кнопки для каждого устройства
+    for username, _, days_left in devices:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🔑 {username} ({days_left} дней)", 
+                callback_data=f"apply_bonus_{bonus_id}_{username}"
+            )
+        ])
+    
+    # Добавляем кнопку отмены
+    buttons.append([
+        InlineKeyboardButton(
+            text="❌ Отмена", 
+            callback_data=f"cancel_bonus_{bonus_id}"
+        )
     ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # === Обработчики команд и callback-запросов ===
@@ -598,22 +975,75 @@ if not os.path.exists(MEDIA_DIR):
 async def send_welcome(message: types.Message):
     """Обработчик команды /start."""
     user_id = message.from_user.id
-    is_new_user = False
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+
     
-    logger.info(f"Команда /start от пользователя {user_id} ({message.from_user.username or 'без имени'})")
+    # Извлекаем параметры из команды /start заранее
+    referrer_id = None
+    message_text = message.text.strip()
     
-    # Регистрируем пользователя в базе данных
+    if message_text and len(message_text) > 6:  # Длиннее, чем просто "/start"
+        try:
+            # Извлекаем параметры из команды /start
+            parts = message_text.split()
+            
+            if len(parts) > 1:
+                param = parts[1]
+                
+                # Проверяем, это реферальная ссылка или активация бонуса
+                if param.startswith("bonus_"):
+                    # Бонусы через /start больше не обрабатываются
+                    await message.answer(
+                        "⚠️ Активация бонусов через команду /start более недоступна.\n"
+                        "Пожалуйста, воспользуйтесь разделом 'Партнерская программа' в главном меню.",
+                        reply_markup=get_back_to_menu_keyboard()
+                    )
+                    return
+                elif param.isdigit():
+                    # Это ID реферера
+                    referrer_id = int(param)
+                else:
+                    # Это может быть буквенно-цифровой реферальный код
+                    
+                    # Ищем пользователя по реферальному коду через новую функцию
+                    referrer_id = await find_user_by_referral_code(param)
+        except Exception as e:
+            logger.error(f"[REFERRAL_LOG] Ошибка при обработке параметров start: {e}")
+            logger.error(traceback.format_exc())
+    
+    # Проверяем, существует ли пользователь
+    user_exists = await check_user_exists(user_id)
+    is_new_user = not user_exists
+    
+    
     try:
-        # Проверяем, существует ли пользователь
-        user_exists = await check_user_exists(user_id)
-        
-        # Если пользователя нет, регистрируем его
+        # Важно: сначала регистрируем пользователя (если его нет), а затем применяем реферальный код
         if not user_exists:
-            registration_success = await register_user(user_id)
+            # Если пользователя нет, регистрируем его
+            registration_success = await register_user(user_id, username, first_name, last_name)
             if registration_success:
                 is_new_user = True
+                
+                # Делаем небольшую паузу, чтобы гарантировать, что пользователь зарегистрирован в базе
+                await asyncio.sleep(0.5)
             else:
-                logger.error(f"Не удалось зарегистрировать пользователя {user_id}")
+                logger.error(f"[REFERRAL_LOG] Не удалось зарегистрировать пользователя {user_id}")
+        
+        # Обработка реферального кода только если был передан referrer_id и это не сам пользователь
+        if referrer_id and referrer_id != user_id:
+            # Проверяем, существует ли реферер
+            referrer_exists = await check_user_exists(referrer_id)
+            
+            if referrer_exists:
+                # Добавляем реферальную запись
+                referral_added = await add_referral(referrer_id, user_id)
+                
+                if referral_added:
+                    pass
+                else:
+                    logger.error(f"[REFERRAL_LOG] Не удалось привязать пользователя {user_id} к рефереру {referrer_id}")
     except Exception as e:
         logger.error(f"Ошибка при регистрации пользователя {user_id}: {e}")
         logger.error(traceback.format_exc())
@@ -623,79 +1053,51 @@ async def send_welcome(message: types.Message):
         photo = FSInputFile(os.path.join(MEDIA_DIR, "logo.jpg"))
         await message.answer_photo(
             photo=photo,
-            caption="🌐 *XGuard VPN*\n\n"
+            caption="🌐 <b>XGUARD VPN</b>\n\n"
                     "✅ Максимальная скорость\n"
                     "✅ Работает везде и всегда\n"
                     "✅ Доступен iPhone, Android, Windows, TV\n"
                     "✅ Лучшие технологии шифрования\n\n"
                     "Выберите действие:",
             reply_markup=get_main_menu_keyboard(),
-            parse_mode="MarkdownV2"
+            parse_mode="HTML"
         )
     except Exception as e:
-        logger.error(f"Ошибка при отправке приветственного сообщения пользователю {user_id}: {e}")
+        logger.error(f"Ошибка при отправке приветственного сообщения: {e}")
         logger.error(traceback.format_exc())
-    
+        
     # Если пользователь новый, создаем ключ и отправляем специальное сообщение
     if is_new_user:
         await asyncio.sleep(1)  # Небольшая задержка для последовательности сообщений
         try:
-            # Проверяем, имеет ли пользователь право на тестовый период
-            async with db_pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT test_period FROM telegram_users WHERE user_id = %s", (user_id,))
-                    test_period_result = await cur.fetchone()
-                    
-                    if test_period_result and test_period_result[0] == 1:
-                        vpn_link = await activate_test_period(user_id)
-                        
-                        if vpn_link:
-                            # Создаем клавиатуру с кнопками для перехода к инструкциям
-                            instructions_kb = InlineKeyboardMarkup(inline_keyboard=[
-                                [InlineKeyboardButton(text="📱 Android", callback_data="instruction_android"),
-                                 InlineKeyboardButton(text="🍎 iOS", callback_data="instruction_ios")],
-                                [InlineKeyboardButton(text="💻 Windows", callback_data="instruction_windows"),
-                                 InlineKeyboardButton(text="🖥 macOS", callback_data="instruction_macos")],
-                                [InlineKeyboardButton(text="📋 Мои ключи", callback_data="my_keys")],
-                                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
-                            ])
-                            
-                            # Отправляем специальное сообщение о тестовом доступе
-                            await message.answer(
-                                "🎁 <b>ПОЗДРАВЛЯЕМ!</b> 🎁\n\n"
-                                "✅ Вам предоставлен <b>БЕСПЛАТНЫЙ тестовый доступ на 7 дней</b> к нашему VPN!\n\n"
-                                "🔑 <b>Ваша VPN-ссылка для подключения:</b>\n"
-                                f"<code>{vpn_link}</code>\n\n"
-                                "📲 <b>Как подключиться?</b>\n"
-                                "1. Установите приложение для вашей платформы\n"
-                                "2. Скопируйте вашу VPN-ссылку\n"
-                                "3. Вставьте её в приложение\n\n"
-                                "👇 <b>Выберите ваше устройство для подробной инструкции:</b>",
-                                reply_markup=instructions_kb,
-                                parse_mode="HTML"
-                            )
-                            
-                            # Дополнительное пояснение по использованию
-                            await asyncio.sleep(1)
-                            await message.answer(
-                                "💡 <b>Совет:</b> Используйте раздел «Мои ключи» для управления вашим VPN-доступом.\n\n"
-                                "⏱ Не забудьте, что ваш тестовый доступ действует <b>7 дней</b>.\n"
-                                "После этого вы можете продлить его в разделе «Купить VPN».",
-                                parse_mode="HTML"
-                            )
-                        else:
-                            logger.error(f"Не удалось создать VPN-доступ для пользователя {user_id}")
-                            await message.answer(
-                                "❌ <b>К сожалению, не удалось создать VPN-доступ.</b>\n\n"
-                                "Пожалуйста, попробуйте позже или обратитесь в поддержку.",
-                                parse_mode="HTML"
-                            )
-                    else:
-                        logger.info(f"Пользователь {user_id} уже использовал тестовый период")
+            # Создаем VPN ключ напрямую, без проверки test_period
+            vpn_link = await create_vless_user(user_id)
+            
+            if vpn_link:
+                # Создаем клавиатуру с кнопками для перехода к инструкциям
+                instructions_kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📱 Android", callback_data="instruction_android"),
+                     InlineKeyboardButton(text="🍎 iOS", callback_data="instruction_ios")],
+                    [InlineKeyboardButton(text="💻 Windows", callback_data="instruction_windows"),
+                     InlineKeyboardButton(text="🖥 macOS", callback_data="instruction_macos")],
+                    [InlineKeyboardButton(text="📋 Мои ключи", callback_data="my_keys")],
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+                ])
+                
+                # Отправляем сообщение с ключом и инструкцию
+                await message.answer(
+                    f"🎁 <b>Поздравляем!</b>\n\n"
+                    f"Вам доступен бесплатный тестовый период на <b>{DEFAULT_TEST_PERIOD} дней</b>!\n\n"
+                    f"Ваш ключ: <code>{vpn_link}</code>\n\n"
+                    f"Выберите вашу платформу для инструкции по подключению:",
+                    reply_markup=instructions_kb,
+                    parse_mode="HTML"
+                )
+            else:
+                logger.error(f"Не удалось создать тестовый ключ для пользователя {user_id}")
         except Exception as e:
             logger.error(f"Ошибка при создании ключа для пользователя {user_id}: {e}")
             logger.error(traceback.format_exc())
-
 
 @dp.callback_query(lambda c: c.data == "menu_main")
 async def handle_menu_main(callback: types.CallbackQuery):
@@ -704,7 +1106,7 @@ async def handle_menu_main(callback: types.CallbackQuery):
     await bot.send_photo(
         chat_id=callback.from_user.id,
         photo=photo,
-        caption="🌐 <b>SAFENET VPN</b>\n\n"
+        caption="🌐 <b>XGUARD VPN</b>\n\n"
                 "✅ Максимальная скорость\n"
                 "✅ Работает везде и всегда\n"
                 "✅ Доступен iPhone, Android, Windows, TV\n"
@@ -716,46 +1118,12 @@ async def handle_menu_main(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(lambda c: c.data == "my_keys")
-async def handle_my_keys(callback: types.CallbackQuery):
-    """Обработчик отображения активных ключей."""
-    user_id = callback.from_user.id
-    devices = await get_user_devices(user_id)
-    
-    if not devices:
-        await bot.send_message(
-            callback.from_user.id,
-            "⚠️ У вас нет активных ключей!\n\nСоздайте новый ключ в разделе 'Купить VPN'.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💰 Купить VPN", callback_data="buy_vpn")],
-                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
-            ])
-        )
-    else:
-        message = "🔐 <b>Ваши ключи VPN:</b>\n\n"
-        for username, _, days in devices:
-            username_display = username.split('_')[0]
-            message += f"🔑 <b>{username_display}</b> ({days} дн.)\n"
-            
-        await bot.send_message(
-            callback.from_user.id,
-            message,
-            reply_markup=get_my_keys_keyboard(devices),
-            parse_mode="HTML"
-        )
-        
-    await callback.answer()
-
-
-@dp.callback_query(lambda c: c.data == "buy_vpn")
-async def handle_buy_vpn(callback: types.CallbackQuery):
-    """Обработчик кнопки покупки/продления VPN."""
-    user_id = callback.from_user.id
-    devices = await get_user_devices(user_id)
-    
+@dp.callback_query(lambda c: c.data == "buy_new_vpn")
+async def handle_buy_new_vpn(callback: types.CallbackQuery):
+    """Обработчик кнопки покупки нового VPN."""
     await bot.send_message(
         callback.from_user.id,
-        "💳 <b>Покупка VPN</b>\n\n"
+        "💳 <b>Покупка нового VPN ключа</b>\n\n"
         "1️⃣ Выбери необходимый тариф ниже 👇\n"
         "2️⃣ Внеси платеж\n"
         "3️⃣ И получи ключ с простой инструкцией\n"
@@ -763,9 +1131,62 @@ async def handle_buy_vpn(callback: types.CallbackQuery):
         "👍 Пользователи говорят, что готовы платить\n"
         "за эту скорость и удобство даже больше\n"
         "✅ Проверь, насколько понравится тебе",
-        reply_markup=get_buy_vpn_keyboard(devices),
+        reply_markup=get_tariff_keyboard(),
         parse_mode="HTML"
     )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "extend_vpn")
+async def handle_extend_vpn(callback: types.CallbackQuery):
+    """Обработчик кнопки продления VPN."""
+    user_id = callback.from_user.id
+    
+    # Отправка индикатора загрузки
+    loading_message = await callback.bot.send_message(
+        user_id,
+        "⏳ Загружаем информацию о ваших ключах...",
+        parse_mode="HTML"
+    )
+    
+    # Запоминаем время начала операции
+    start_time = datetime.now()
+    
+    # Получаем устройства пользователя
+    devices = await get_user_devices(user_id)
+    
+    # Обеспечиваем минимальное время отображения индикатора загрузки (1 секунда)
+    elapsed = (datetime.now() - start_time).total_seconds()
+    if elapsed < 1:
+        await asyncio.sleep(1 - elapsed)
+    
+    # Удаляем сообщение о загрузке
+    await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+    
+    if not devices:
+        await bot.send_message(
+            callback.from_user.id,
+            "⚠️ У вас нет активных ключей для продления!\n\n"
+            "Сначала создайте новый ключ, используя кнопку 'Купить VPN'.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await bot.send_message(
+            callback.from_user.id,
+            "🔄 <b>Продление VPN</b>\n\n"
+            "Выберите ключ, который хотите продлить:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                *[[InlineKeyboardButton(
+                    text=f"🔑 {username.split('_')[0]} ({days} дн.)", 
+                    callback_data=f"pay_key_{username}")]
+                  for username, _, days in devices],
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+            ]),
+            parse_mode="HTML"
+        )
     await callback.answer()
 
 
@@ -792,121 +1213,641 @@ async def handle_create_new_key(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("new_key_"))
 async def handle_new_key_payment(callback: types.CallbackQuery):
     """Обработчик оплаты нового ключа."""
+    user_id = callback.from_user.id
     parts = callback.data.split("_")  # new_key_30_150
     days = parts[2]
     amount = parts[3]
     
-    payment = Payment.create({
-        "amount": {"value": amount, "currency": "RUB"},
-        "confirmation": {"type": "redirect", "return_url": "https://your-site.com/success"},
-        "capture": True,
-        "description": f"Создание нового ключа на {days} дней",
-        "metadata": {
-            "user_id": callback.from_user.id, 
-            "action": "new_key", 
-            "days": days, 
-            "amount": amount
-        }
-    })
-    
-    await bot.send_message(
-        callback.from_user.id,
-        f"📅 Период: <b>{days} дней</b>\n"
-        f"💰 Сумма: <b>{amount} RUB</b>\n\n"
-        f"Для оплаты перейдите по ссылке:\n {payment.confirmation.confirmation_url}",
-        reply_markup=get_back_to_menu_keyboard(),
-        parse_mode="HTML"  # HTML для корректного форматирования текста
+    # Отправка индикатора загрузки
+    loading_message = await callback.bot.send_message(
+        user_id,
+        "⏳ Создаем платеж...",
+        parse_mode="HTML"
     )
-    await callback.answer()
+    
+    # Запоминаем время начала операции
+    start_time = datetime.now()
+    
+    try:
+        payment = Payment.create({
+            "amount": {"value": amount, "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": "https://your-site.com/success"},
+            "capture": True,
+            "description": f"Создание нового ключа на {days} дней",
+            "metadata": {
+                "user_id": callback.from_user.id, 
+                "action": "new_key", 
+                "days": days, 
+                "amount": amount
+            }
+        })
+        
+        # Обеспечиваем минимальное время отображения индикатора загрузки (1 секунда)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        if elapsed < 1:
+            await asyncio.sleep(1 - elapsed)
+        
+        # Удаляем сообщение о загрузке
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        
+        await bot.send_message(
+            callback.from_user.id,
+            f"📅 Период: <b>{days} дней</b>\n"
+            f"💰 Сумма: <b>{amount} RUB</b>\n\n"
+            f"Для оплаты перейдите по ссылке:\n {payment.confirmation.confirmation_url}",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"  # HTML для корректного форматирования текста
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка при создании платежа: {e}")
+        logger.error(traceback.format_exc())
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        await callback.bot.send_message(
+            user_id,
+            "❌ Произошла ошибка при создании платежа. Пожалуйста, попробуйте позже.",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"
+        )
 
 
 @dp.callback_query(lambda c: c.data.startswith("pay_key_"))
 async def handle_pay_key(callback: types.CallbackQuery):
     """Обработчик выбора ключа для оплаты."""
+    user_id = callback.from_user.id
     username = callback.data.split("pay_key_")[1]
-    keyboard = get_tariff_keyboard(username)
     
-    await bot.send_message(
-        callback.from_user.id,
-        "💰 Выберите тарифный план\n\n"
-        "✅ Безлимитный трафик\n"
-        "✅ Максимальная скорость\n"
-        "✅ Доступ ко всем серверам\n"
-        "✅ Поддержка 24/7",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+    # Отправка индикатора загрузки
+    loading_message = await callback.bot.send_message(
+        user_id,
+        "⏳ Загружаем тарифы для продления...",
+        parse_mode="HTML"
     )
-    await callback.answer()
+    
+    # Запоминаем время начала операции
+    start_time = datetime.now()
+    
+    try:
+        # Получаем клавиатуру с тарифами
+        keyboard = get_tariff_keyboard(username)
+        
+        # Обеспечиваем минимальное время отображения индикатора загрузки (1 секунда)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        if elapsed < 1:
+            await asyncio.sleep(1 - elapsed)
+        
+        # Удаляем сообщение о загрузке
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        
+        await bot.send_message(
+            callback.from_user.id,
+            "💰 Выберите тарифный план\n\n"
+            "✅ Безлимитный трафик\n"
+            "✅ Максимальная скорость\n"
+            "✅ Доступ ко всем серверам\n"
+            "✅ Поддержка 24/7",
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке тарифов для продления: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Удаляем сообщение о загрузке
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        
+        await callback.bot.send_message(
+            user_id,
+            "❌ Произошла ошибка при загрузке тарифов. Пожалуйста, попробуйте позже.",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"
+        )
 
 
 @dp.callback_query(lambda c: c.data.startswith("pay_"))
 async def handle_payment(callback: types.CallbackQuery):
     """Обработчик создания платежа."""
+    user_id = callback.from_user.id
     parts = callback.data.split("_")  # pay_username_30_150
     username = "_".join(parts[1:-2])  # Собираем username обратно
     days = parts[-2]
     amount = parts[-1]
     
-    payment = Payment.create({
-        "amount": {"value": amount, "currency": "RUB"},
-        "confirmation": {"type": "redirect", "return_url": "https://your-site.com/success"},
-        "capture": True,
-        "description": f"Продление ключа {username.split('_')[0]} на {days} дней",
-        "metadata": {
-            "user_id": callback.from_user.id, 
-            "username": username, 
-            "days": days, 
-            "amount": amount,
-            "action": "extend_key"  # Добавляем тип действия
-        }
-    })
-    
-    await bot.send_message(
-        callback.from_user.id,
-        f"🔑 Ключ: <b>{username.split('_')[0]}</b>\n"
-        f"📅 Период: <b>{days} дней</b>\n"
-        f"💰 Сумма: <b>{amount} RUB</b>\n\n"
-        f"Для оплаты перейдите по ссылке:\n {payment.confirmation.confirmation_url}",
-        reply_markup=get_back_to_menu_keyboard(),
-        parse_mode="HTML"  # HTML для корректного форматирования текста
+    # Отправка индикатора загрузки
+    loading_message = await callback.bot.send_message(
+        user_id,
+        "⏳ Создаем платеж для продления...",
+        parse_mode="HTML"
     )
-    await callback.answer()
+    
+    # Запоминаем время начала операции
+    start_time = datetime.now()
+    
+    try:
+        payment = Payment.create({
+            "amount": {"value": amount, "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": "https://your-site.com/success"},
+            "capture": True,
+            "description": f"Продление ключа {username.split('_')[0]} на {days} дней",
+            "metadata": {
+                "user_id": callback.from_user.id, 
+                "username": username, 
+                "days": days, 
+                "amount": amount,
+                "action": "extend_key"  # Добавляем тип действия
+            }
+        })
+        
+        # Обеспечиваем минимальное время отображения индикатора загрузки (1 секунда)
+        elapsed = (datetime.now() - start_time).total_seconds()
+        if elapsed < 1:
+            await asyncio.sleep(1 - elapsed)
+        
+        # Удаляем сообщение о загрузке
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        
+        await bot.send_message(
+            callback.from_user.id,
+            f"🔑 Ключ: <b>{username.split('_')[0]}</b>\n"
+            f"📅 Период: <b>{days} дней</b>\n"
+            f"💰 Сумма: <b>{amount} RUB</b>\n\n"
+            f"Для оплаты перейдите по ссылке:\n {payment.confirmation.confirmation_url}",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"  # HTML для корректного форматирования текста
+        )
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Ошибка при создании платежа для продления: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Удаляем сообщение о загрузке
+        await callback.bot.delete_message(chat_id=user_id, message_id=loading_message.message_id)
+        
+        await callback.bot.send_message(
+            user_id,
+            "❌ Произошла ошибка при создании платежа. Пожалуйста, попробуйте позже.",
+            reply_markup=get_back_to_menu_keyboard(),
+            parse_mode="HTML"
+        )
 
 @dp.callback_query(lambda c: c.data == "help")
 async def handle_help(callback: types.CallbackQuery):
     """Обработчик кнопки помощи."""
-    message = "<b>👨‍💻 Служба поддержки</b>\n\n"
-    message += "По всем вопросам обращайтесь:\n"
-    message += "👨‍💻 Администратор: @safenet_admin\n"
-    message += "⚡️ Время работы: 24/7\n"
-    message += "📝 Среднее время ответа: 5-10 минут"
+    message = "<b>❓ Центр помощи и поддержки</b>\n\n"
+    message += "Выберите интересующий вас раздел:\n\n"
+    message += "• У нас высокоскоростные серверы в разных странах\n"
+    message += "• Техническая поддержка 24/7\n"
+    message += "• Стабильное соединение и высокий уровень безопасности\n"
+    message += "• Простая настройка на всех устройствах"
+    
+    help_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Правила/Оферта", callback_data="help_rules")],
+        [InlineKeyboardButton(text="⚠️ Не работает VPN", callback_data="help_vpn_issue")],
+        [InlineKeyboardButton(text="📞 Связаться с нами", callback_data="help_contact")],
+        [InlineKeyboardButton(text="🔌 Как подключиться", callback_data="help_connection")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    ])
     
     await bot.send_message(
         callback.from_user.id,
         message,
-        reply_markup=get_back_to_menu_keyboard(),
+        reply_markup=help_keyboard,
         parse_mode="HTML"
     )
     await callback.answer()
 
+
+@dp.callback_query(lambda c: c.data == "help_rules")
+async def handle_help_rules(callback: types.CallbackQuery):
+    """Обработчик кнопки правил и оферты."""
+    message = "<b>📜 Правила использования и Оферта</b>\n\n"
+    message += "1️⃣ <b>Общие положения</b>\n"
+    message += "• Сервис предоставляется «как есть» без гарантий\n"
+    message += "• Мы не несем ответственности за действия пользователей\n\n"
+    
+    message += "2️⃣ <b>Правила использования</b>\n"
+    message += "• Запрещены любые незаконные действия\n"
+    message += "• Запрещено использование для спама и рассылок\n"
+    message += "• Запрещена передача ключей третьим лицам\n\n"
+    
+    message += "3️⃣ <b>Условия оплаты</b>\n"
+    message += "• Оплаченный период не подлежит возврату\n"
+    message += "• Оплата производится в соответствии с выбранным тарифом\n\n"
+    
+    message += "Продолжая использовать наш сервис, вы автоматически соглашаетесь с указанными условиями."
+    
+    help_back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к помощи", callback_data="help")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    ])
+    
+    await bot.send_message(
+        callback.from_user.id,
+        message,
+        reply_markup=help_back_keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "help_vpn_issue")
+async def handle_help_vpn_issue(callback: types.CallbackQuery):
+    """Обработчик кнопки проблем с VPN."""
+    message = "<b>⚠️ Не работает VPN? Решение проблем</b>\n\n"
+    message += "Если у вас возникли проблемы с подключением, попробуйте следующие шаги:\n\n"
+    
+    message += "1️⃣ <b>Основные проверки</b>\n"
+    message += "• Проверьте подключение к интернету\n"
+    message += "• Убедитесь, что срок действия вашего ключа не истёк\n"
+    message += "• Перезапустите приложение VPN\n\n"
+    
+    message += "2️⃣ <b>Технические решения</b>\n"
+    message += "• Попробуйте подключиться через другой сервер\n"
+    message += "• Обновите приложение VPN до последней версии\n"
+    message += "• Проверьте настройки брандмауэра и антивируса\n\n"
+    
+    message += "3️⃣ <b>Если ничего не помогает</b>\n"
+    message += "• Свяжитесь с нашей технической поддержкой\n"
+    message += "• Мы решим вашу проблему в кратчайшие сроки"
+    
+    help_back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к помощи", callback_data="help")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    ])
+    
+    await bot.send_message(
+        callback.from_user.id,
+        message,
+        reply_markup=help_back_keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "help_contact")
+async def handle_help_contact(callback: types.CallbackQuery):
+    """Обработчик кнопки связи с поддержкой."""
+    message = "<b>📞 Связаться с нами</b>\n\n"
+    message += "Наша служба поддержки всегда готова помочь вам с любыми вопросами и проблемами:\n\n"
+    
+    message += "👨‍💻 <b>Техническая поддержка:</b> @Xguard_SupportBot\n"
+    message += "⏱ <b>Время работы:</b> 24/7\n"
+    message += "⚡️ <b>Среднее время ответа:</b> 5-10 минут\n\n"
+    
+    message += "При обращении в поддержку, пожалуйста, опишите вашу проблему максимально подробно."
+    
+    help_back_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url="https://t.me/Xguard_SupportBot")],
+        [InlineKeyboardButton(text="◀️ Назад к помощи", callback_data="help")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    ])
+    
+    await bot.send_message(
+        callback.from_user.id,
+        message,
+        reply_markup=help_back_keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "help_connection")
+async def handle_help_connection(callback: types.CallbackQuery):
+    """Обработчик кнопки инструкции по подключению."""
+    message = "<b>🔌 Как подключиться к VPN</b>\n\n"
+    message += "Следуйте этим простым шагам для настройки VPN на вашем устройстве:\n\n"
+    
+    message += "1️⃣ <b>Покупка ключа</b>\n"
+    message += "• Выберите подходящий тариф в разделе «Купить VPN»\n"
+    message += "• Оплатите выбранный тариф\n"
+    message += "• Получите ваш личный ключ\n\n"
+    
+    message += "2️⃣ <b>Установка приложения</b>\n"
+    message += "• Скачайте специальное приложение для вашей платформы\n"
+    message += "• Установите и запустите приложение\n\n"
+    
+    message += "3️⃣ <b>Подключение</b>\n"
+    message += "• Добавьте ваш ключ в приложение\n"
+    message += "• Выберите желаемый сервер\n"
+    message += "• Нажмите кнопку подключения\n\n"
+    
+    message += "Выберите вашу платформу для получения подробной инструкции:"
+    
+    platforms_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📱 Android", callback_data="instruction_android"),
+            InlineKeyboardButton(text="📱 iOS", callback_data="instruction_ios")
+        ],
+        [
+            InlineKeyboardButton(text="💻 Windows", callback_data="instruction_windows"),
+            InlineKeyboardButton(text="💻 macOS", callback_data="instruction_macos")
+        ],
+        [InlineKeyboardButton(text="◀️ Назад к помощи", callback_data="help")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+    ])
+    
+    await bot.send_message(
+        callback.from_user.id,
+        message,
+        reply_markup=platforms_keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "my_keys")
+async def handle_my_keys(callback: types.CallbackQuery):
+    """Обработчик кнопки 'Мои активные ключи'."""
+    try:
+        user_id = callback.from_user.id
+        await callback.answer()
+        
+        # Отправляем сообщение о загрузке
+        loading_message = await callback.message.answer("⏳ Загружаем информацию о ваших ключах...")
+        
+        # Получаем список устройств пользователя
+        devices = await get_user_devices(user_id)
+        
+        if not devices:
+            await loading_message.delete()
+            await callback.message.answer(
+                "У вас нет активных ключей. Нажмите кнопку 'Создать новый ключ', чтобы создать ключ.",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            return
+            
+        # Создаем клавиатуру с ключами пользователя
+        keyboard = get_my_keys_keyboard(devices)
+        
+        # Отправляем сообщение с клавиатурой
+        await loading_message.delete()
+        await callback.message.answer(
+            "🔑 <b>Ваши активные ключи:</b>\n\n"
+            "Выберите ключ для просмотра подробной информации:",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике 'Мои активные ключи': {e}")
+        logger.error(traceback.format_exc())
+        await callback.message.answer(
+            "❌ Произошла ошибка при получении ваших ключей. Пожалуйста, попробуйте позже.",
+            reply_markup=get_back_to_menu_keyboard()
+        )
 
 @dp.callback_query(lambda c: c.data == "affiliate")
 async def handle_affiliate(callback: types.CallbackQuery):
-    """Обработчик партнерской программы."""
-    await bot.send_message(
-        callback.from_user.id,
-        "👥 <b>Партнерская программа</b>\n\n"
-        "💰 Зарабатывайте с нами:\n"
-        "• 20% с каждой оплаты реферала\n"
-        "• Моментальные выплаты\n"
-        "• Без ограничений по рефералам\n\n"
-        "🔗 Ваша реферальная ссылка:\n"
-        f"<code>https://t.me/safenet_bot?start={callback.from_user.id}</code>",
-        reply_markup=get_back_to_menu_keyboard(),
-        parse_mode="HTML"
-    )
-    await callback.answer()
+    try:
+        user_id = callback.from_user.id
+        await callback.answer()
+        
+        # Отправляем сообщение о загрузке
+        loading_message = await callback.message.answer("⏳ Загружаем информацию...")
+        
+        # Получаем токен для доступа к API
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        try:
+            # Получаем данные о пользователе
+            response = await async_api_request(
+                "GET", 
+                f"{MARZBAN_URL}api/telegram_user/{user_id}", 
+                headers=headers
+            )
+            
+            if not response or response.get("success") != True:
+                logger.error(f"Ошибка при получении данных пользователя: {response}")
+                
+            user_data = response.get("data", {})
+            referral_code = user_data.get("referral_code")
+            
+            # Если у пользователя нет реферального кода, генерируем его
+            if not referral_code:
+                try:
+                    response = await async_api_request(
+                        "POST", 
+                        f"{MARZBAN_URL}api/referral/code/{user_id}", 
+                        headers=headers
+                    )
+                    
+                    if not response or response.get("success") != True:
+                        logger.error(f"Ошибка при генерации реферального кода: {response}")
+                        
+                    user_data = response.get("data", {})
+                    referral_code = user_data.get("referral_code")
+                    
+                    # Если код все еще не получен, пробуем альтернативный URL
+                    if not referral_code:
+                        alt_response = await async_api_request(
+                            "POST", 
+                            f"{MARZBAN_URL}api/telegram_user/{user_id}/generate_code", 
+                            headers=headers
+                        )
+                                                
+                        if alt_response and alt_response.get("success") == True:
+                            user_data = alt_response.get("data", {})
+                            referral_code = user_data.get("referral_code")
+                except Exception as e:
+                    logger.error(f"Ошибка при генерации реферального кода: {e}")
+            
+            # Получаем количество рефералов
+            ref_count = await get_referral_count(user_id)
+            
+            # Получаем количество доступных бонусных дней
+            bonus_days = await get_referral_bonus_days(user_id)
+            
+            # Текст сообщения с информацией о партнерской программе
+            message_text = (
+                "🤝 <b>Партнерская программа</b>\n\n"
+                "Приглашайте друзей и получайте бонусы!\n\n"
+                "За каждого приглашенного друга вы получаете 7 дней бесплатного использования VPN.\n\n"
+                f"👥 Ваши приглашенные: <b>{ref_count}</b>\n"
+                f"⏱ Доступные бонусы: <b>{bonus_days} дней</b>\n\n"
+            )
+            
+            # Добавляем информацию о реферальной ссылке
+            if referral_code:
+                bot_username = (await bot.get_me()).username
+                ref_link = f"https://t.me/{bot_username}?start={referral_code}"
+                message_text += f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
+            
+            # Создаем клавиатуру с кнопками
+            keyboard_buttons = []
 
+            # Добавляем кнопку для копирования реф.ссылки
+
+            # Если есть доступные бонусы, добавляем кнопку для применения
+            if bonus_days > 0:
+                keyboard_buttons.append([
+                    InlineKeyboardButton(
+                        text="🎁 Применить бонус к ключу", 
+                        callback_data="select_key_for_bonus"
+                    )
+                ])
+
+            # Добавляем кнопку для возврата в главное меню
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text="🔙 Вернуться в меню", 
+                    callback_data="menu_main"
+                )
+            ])
+
+            # Создаем клавиатуру
+            keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+            
+            # Отправляем сообщение с клавиатурой - используем answer вместо edit_text
+            await callback.message.answer(message_text, reply_markup=keyboard, parse_mode="HTML")
+            
+        except Exception as e:
+            logger.error(f"Ошибка в обработчике партнерской программы: {e}")
+            # Используем answer вместо edit_text
+            await callback.message.answer(
+                "❌ Произошла ошибка при загрузке данных партнерской программы. Пожалуйста, попробуйте позже.",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+        
+        # Удаляем сообщение о загрузке
+        try:
+            await loading_message.delete()
+        except Exception as e:
+            logger.warning(f"Не удалось удалить сообщение о загрузке: {e}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка в обработчике партнерской программы: {e}")
+        traceback.print_exc()
+        try:
+            # Используем answer вместо edit_text
+            await callback.message.answer(
+                "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+        except:
+            pass
+
+@dp.callback_query(lambda c: c.data.startswith("copy_ref_link_"))
+async def handle_copy_ref_link(callback: types.CallbackQuery):
+    """Обработчик кнопки копирования реферальной ссылки."""
+    try:
+        referral_code = callback.data.replace("copy_ref_link_", "")
+        bot_username = (await bot.get_me()).username
+        referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+        
+        await callback.answer("Ссылка скопирована!")
+        await callback.message.answer(f"Ваша реферальная ссылка:\n<code>{referral_link}</code>", parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка при копировании реферальной ссылки: {e}")
+        logger.error(traceback.format_exc())
+        await callback.answer("Произошла ошибка при копировании ссылки.")
+
+@dp.callback_query(lambda c: c.data == "select_key_for_bonus")
+async def select_key_for_bonus(callback: types.CallbackQuery):
+    """Обработчик выбора ключа для применения бонуса."""
+    try:
+        await callback.answer()
+        user_id = callback.from_user.id
+        
+        # Получаем активные бонусы пользователя
+        active_bonuses = await get_active_bonuses(user_id)
+        
+        if not active_bonuses:
+            await callback.message.answer("У вас нет доступных бонусов.")
+            return
+            
+        # Берем первый доступный бонус
+        bonus_id = active_bonuses[0].get("id")
+        
+        # Получаем список ключей пользователя
+        devices = await get_user_devices(user_id)
+        
+        if not devices:
+            await callback.message.answer("У вас нет активных ключей. Сначала создайте ключ.")
+            return
+        
+        # Создаем клавиатуру с выбором ключей
+        keyboard_buttons = []
+        
+        for device in devices:
+            username, vless_link, days_left = device
+            
+            # Получаем отображаемое имя (первая часть до символа _)
+            display_name = username.split('_')[0] if isinstance(username, str) and '_' in username else username
+            
+            # Форматируем отображение для дней
+            days_display = "неизвестно"
+            if isinstance(days_left, int):
+                days_display = f"{days_left} дней"
+            elif days_left == 999:
+                days_display = "∞ (бессрочно)"
+            
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text=f"🔑 {display_name} ({days_display})",
+                    callback_data=f"apply_bonus_{bonus_id}#{username}"
+                )
+            ])
+        
+        # Добавляем кнопку отмены
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data="affiliate"
+            )
+        ])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        
+        await callback.message.answer(
+            "Выберите ключ, к которому хотите применить бонус:",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при выборе ключа для бонуса: {e}")
+        logger.error(traceback.format_exc())
+        await callback.message.answer("❌ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
+
+
+@dp.callback_query(lambda c: c.data.startswith("apply_bonus_"))
+async def apply_bonus_handler(callback: types.CallbackQuery):
+    """Обработчик применения бонуса к ключу."""
+    try:
+        await callback.answer()
+        
+        # Формат данных: apply_bonus_id#username
+        # где id - это ID бонуса, username - имя пользователя Marzban
+        bonus_data = callback.data.replace("apply_bonus_", "")
+        bonus_id, marzban_username = bonus_data.split("#")
+        
+        user_id = callback.from_user.id
+        
+        # Применяем бонус
+        result = await apply_bonus_to_key(user_id, int(bonus_id), marzban_username)
+        
+        if not result.get("success"):
+            logger.error(f"Ошибка при применении бонуса: {result.get('error')}")
+            await callback.message.answer(
+                "❌ Ошибка при применении бонуса. Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            return
+            
+        days_added = result.get("days_added", 0)
+        new_expire_date = result.get("new_expire_date", "Неизвестно")
+        
+        await callback.message.answer(
+            f"✅ Бонус успешно применен!\n\n"
+            f"Вы добавили {days_added} дней к ключу {marzban_username}.\n"
+            f"Новая дата окончания: {new_expire_date}",
+            reply_markup=get_back_to_menu_keyboard()
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при применении бонуса: {e}")
+        logger.error(traceback.format_exc())
+        await callback.message.answer(
+            "❌ Произошла ошибка. Пожалуйста, попробуйте позже или обратитесь в поддержку.",
+            reply_markup=get_back_to_menu_keyboard()
+        )
 
 @dp.callback_query(lambda c: c.data.startswith("device_info_"))
 async def handle_device_info(callback: types.CallbackQuery):
@@ -925,10 +1866,13 @@ async def handle_device_info(callback: types.CallbackQuery):
         return await callback.answer()
 
     try:
-        api = MarzbanAPI(base_url=MARZBAN_URL)
-        user_info = await api.get_user(username, token)
+        # Получаем информацию о пользователе через API
+        url = f"{MARZBAN_URL}api/user/{username}"
+        headers = {"Authorization": f"Bearer {token}"}
         
-        if not user_info or not user_info.links:
+        user_result = await async_api_request("get", url, headers=headers)
+        
+        if not user_result["success"] or not user_result["data"].get("links"):
             await bot.send_message(
                 user_id,
                 "❌ Ключ не найден или был удален.",
@@ -937,22 +1881,23 @@ async def handle_device_info(callback: types.CallbackQuery):
             )
             return await callback.answer()
             
-        vless_link = user_info.links[0]
+        user_info = user_result["data"]
+        vless_link = user_info["links"][0]
         
         # Вычисляем срок действия
         days_left = 0
         created_at = "Неизвестно"
         expire_date = "Неизвестно"
         
-        if user_info.expire:
-            expire_timestamp = user_info.expire
+        if user_info.get("expire"):
+            expire_timestamp = user_info["expire"]
             expire_dt = datetime.fromtimestamp(expire_timestamp)
             days_left = (expire_dt - datetime.now()).days
             expire_date = expire_dt.strftime('%d.%m.%Y')
         
         # Пытаемся получить дату создания из Marzban API, если возможно
-        if hasattr(user_info, 'created_at'):
-            created_at_value = user_info.created_at
+        if "created_at" in user_info:
+            created_at_value = user_info["created_at"]
             try:
                 # Если дата - строка в формате ISO
                 if isinstance(created_at_value, str):
@@ -1156,12 +2101,19 @@ def convert_iso_to_mysql_datetime(iso_date_str: str) -> str:
 async def verify_marzban_token(token: str) -> bool:
     """Проверяет валидность JWT токена Marzban"""
     try:
-        # Создаем экземпляр API Marzban
-        api = MarzbanAPI(base_url=MARZBAN_URL)
-        # Проверяем токен, пытаясь получить текущего пользователя
-        current_admin = await api.get_current_admin(token)
-        # Если успешно получили информацию, токен действителен
-        return current_admin is not None
+        # Формируем URL для запроса информации о текущем админе
+        url = f"{MARZBAN_URL}api/admin"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Выполняем запрос с помощью нашей универсальной функции
+        result = await async_api_request(
+            method="get",
+            url=url,
+            headers=headers
+        )
+        
+        # Проверяем успешность запроса
+        return result["success"]
     except Exception as e:
         logger.error(f"Ошибка при проверке токена Marzban: {e}")
         return False
@@ -1174,7 +2126,6 @@ async def handle_messages_page(request: web.Request):
         marzban_token = request.cookies.get('token')
         if not marzban_token or not await verify_marzban_token(marzban_token):
             # Перенаправляем на страницу входа Marzban
-            logger.info("Попытка доступа к странице сообщений без авторизации")
             return web.HTTPFound(f"{MARZBAN_URL}dashboard/#/login")
         
         # Пользователь авторизован, перенаправляем на страницу сообщений
@@ -1189,8 +2140,6 @@ async def handle_api_send_message(request: web.Request):
     """Обработчик API для отправки сообщений всем пользователям бота."""
     try:
         # Добавляем подробное логирование запроса для отладки
-        logger.info(f"Получен запрос на отправку сообщения: {request.method} {request.url}")
-        logger.info(f"Заголовки запроса: {request.headers}")
         
         # Проверка авторизации через токен API
         api_auth_header = request.headers.get('Authorization', '')
@@ -1244,7 +2193,7 @@ async def handle_api_send_message(request: web.Request):
         
         # Получаем список пользователей
         if all_users:
-            async with db_pool.acquire() as conn:
+            async with DB_POOL.acquire() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute("SELECT user_id FROM telegram_users")
                     telegram_ids = [row[0] for row in await cur.fetchall()]
@@ -1303,9 +2252,83 @@ async def handle_api_send_message(request: web.Request):
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 
+# Класс для ограничения скорости запросов (защита от DDoS и брутфорс атак)
+class RateLimiter:
+    """
+    Класс для ограничения скорости запросов от пользователей.
+    Помогает защитить от DDoS и брутфорс атак.
+    """
+    def __init__(self, max_requests=10, time_window=60):
+        # max_requests - максимальное количество запросов
+        # time_window - временное окно в секундах
+        self.max_requests = max_requests
+        self.time_window = time_window
+        self.requests = {}  # {ip: [(timestamp1), (timestamp2), ...]}
+        
+    def is_rate_limited(self, ip):
+        """
+        Проверяет, не превышен ли лимит запросов для данного IP.
+        Возвращает (is_limited, retry_after), где:
+        - is_limited: bool - превышен ли лимит
+        - retry_after: int - через сколько секунд можно повторить запрос
+        """
+        now = datetime.now().timestamp()
+        
+        # Очищаем старые записи
+        if ip in self.requests:
+            # Оставляем только те запросы, которые находятся в текущем временном окне
+            self.requests[ip] = [ts for ts in self.requests[ip] 
+                               if now - ts < self.time_window]
+        else:
+            self.requests[ip] = []
+            
+        # Если количество запросов меньше максимального, добавляем новый запрос
+        if len(self.requests[ip]) < self.max_requests:
+            self.requests[ip].append(now)
+            return False, 0
+            
+        # Вычисляем, через сколько можно повторить запрос
+        oldest_request = min(self.requests[ip])
+        retry_after = int(self.time_window - (now - oldest_request))
+        return True, max(0, retry_after)
+
+# Создаем глобальный экземпляр для ограничения запросов
+api_rate_limiter = RateLimiter(max_requests=20, time_window=60)  # 20 запросов в минуту
+
+# Middleware для ограничения скорости запросов
+@web.middleware
+async def rate_limit_middleware(request, handler):
+    """Middleware для ограничения скорости запросов к API."""
+    # Проверяем, является ли это API-запросом
+    if request.path.startswith('/api/'):
+        # Получаем IP клиента
+        ip = request.remote
+        
+        # Проверяем, не превышен ли лимит запросов
+        is_limited, retry_after = api_rate_limiter.is_rate_limited(ip)
+        
+        if is_limited:
+            # Если лимит превышен, возвращаем ошибку 429 (Too Many Requests)
+            return web.json_response(
+                {
+                    "success": False,
+                    "error": "Слишком много запросов. Пожалуйста, повторите позже.",
+                    "retry_after": retry_after
+                },
+                status=429,
+                headers={"Retry-After": str(retry_after)}
+            )
+    
+    # Продолжаем обработку запроса
+    return await handler(request)
+
+
 # Добавляем маршруты для API сообщений
 def setup_api_routes(app):
     """Настраивает маршруты API для веб-сервера."""
+    # Добавляем middleware для ограничения скорости запросов
+    app.middlewares.append(rate_limit_middleware)
+    
     # Страница сообщений Marzban
     app.router.add_get('/dashboard/messages', handle_messages_page)
     
@@ -1327,9 +2350,7 @@ def setup_api_routes(app):
     # Проверяем и создаем директорию static, если она не существует
     static_dir = os.path.join(SCRIPT_DIR, "static")
     if not os.path.exists(static_dir):
-        logger.info(f"Директория {static_dir} не существует, создаем...")
         os.makedirs(static_dir)
-        logger.info(f"Директория {static_dir} успешно создана")
     
     # Настраиваем статические файлы
     app.router.add_static('/static/', path=static_dir, name="static")
@@ -1374,15 +2395,16 @@ async def on_startup(bot: Bot):
         logger.info("Инициализация пула соединений с базой данных...")
         await init_db_pool()
         
-        if not db_pool:
+        if not DB_POOL:
             logger.error("Не удалось инициализировать пул соединений с базой данных. Бот не может продолжить работу.")
             return
         
-        logger.info("Инициализация базы данных...")
-        await initialize_db()
-        logger.info("База данных успешно инициализирована.")
+        # База данных теперь инициализируется в Marzban
+        logger.info("Подключение к базе данных успешно установлено.")
+        
+        # Не запускаем обработку отложенных бонусов (функция удалена)
     except Exception as db_error:
-        logger.error(f"Критическая ошибка при инициализации базы данных: {db_error}")
+        logger.error(f"Критическая ошибка при инициализации пула соединений с базой данных: {db_error}")
         logger.error(traceback.format_exc())
 
 
@@ -1394,7 +2416,6 @@ async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
     
     # Закрываем соединение с базой данных
-    logger.info("Закрытие соединения с базой данных...")
     await close_db_pool()
     logger.info("Соединение с базой данных закрыто")
 
@@ -1442,14 +2463,12 @@ async def main():
             ssl_context=ssl_context
         )
         for resource in app.router.resources():
-            logger.info(f"Зарегистрирован маршрут: {resource}")
+            pass
         await site.start()
         
-        # Держим приложение запущенным
-        logger.info(f"Бот запущен на {WEBHOOK_URL}")
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        logger.info("Получен сигнал остановки")
+        pass
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}")
         logger.error(traceback.format_exc())
@@ -1460,36 +2479,49 @@ async def main():
 
 
 async def activate_test_period(user_id: int) -> Optional[str]:
-    """Создает VPN ключ на 7 дней для нового пользователя и обновляет флаг test_period."""
+    """Активирует тестовый период для пользователя."""
     try:
-        # Используем локальную функцию create_marzban_user
-        
-        # Создаем ключ на DEFAULT_TEST_PERIOD дней
-        result = await create_marzban_user(user_id, DEFAULT_TEST_PERIOD)
-        
-        if not result["success"]:
-            logger.error(f"Не удалось создать ключ для пользователя {user_id}: {result.get('error')}")
+        # Получаем токен доступа
+        token = await get_access_token()
+        if not token:
             return None
         
-        # Обновляем флаг test_period
-        try:
-            async with db_pool.acquire() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE telegram_users SET test_period = 0 WHERE user_id = %s",
-                        (user_id,)
-                    )
-                    await conn.commit()
-        except Exception as db_error:
-            logger.error(f"Ошибка при обновлении флага test_period: {db_error}")
-            logger.error(traceback.format_exc())
-            # Продолжаем выполнение, даже если обновление флага не удалось
+        # Вместо просто проверки наличия пользователя создаем новый ключ
+        # Используем существующую функцию create_vless_user, которая создает ключ на DEFAULT_TEST_PERIOD дней
+        vpn_link = await create_vless_user(user_id)
         
-        logger.info(f"Создан ключ для пользователя {user_id}")
-        return result["link"]
+        if vpn_link:
+            
+            # Получаем имя пользователя из ссылки
+            try:
+                link_parts = vpn_link.split('vless://')[1].split('@')[0]
+                marzban_username = link_parts.split('?')[0]  # Попытка выделить имя пользователя
                 
+                # Устанавливаем связь с пользователем Telegram через API (дополнительная попытка)
+                if marzban_username:
+                    await link_telegram_user_to_marzban(marzban_username, user_id, token)
+            except Exception as e:
+                logger.error(f"Ошибка при извлечении имени пользователя из ссылки: {e}")
+            
+            # Обновляем статус тестового периода через API
+            api_base_url = f"{MARZBAN_URL}api"
+            user_url = f"{api_base_url}/telegram_user/{user_id}"
+            headers = {"Authorization": f"Bearer {token}"}
+            update_data = {"test_period": False}  # Отмечаем, что тестовый период использован
+            
+            result = await async_api_request("put", user_url, headers=headers, json_data=update_data)
+            
+            if result["success"]:   
+                pass
+            else:
+                logger.error(f"Не удалось обновить статус тестового периода через API: {result['status_code']} {result['error']}")
+            
+            return vpn_link
+            
+        logger.error(f"Не удалось создать ключ для тестового периода пользователя {user_id}")
+        return None
     except Exception as e:
-        logger.error(f"Ошибка при создании ключа для пользователя {user_id}: {e}")
+        logger.error(f"Ошибка при активации тестового периода: {e}")
         logger.error(traceback.format_exc())
         return None
 
@@ -1505,7 +2537,7 @@ async def handle_api_messages_tasks(request: web.Request):
         
         # Получаем задачи из базы данных
         tasks = []
-        async with db_pool.acquire() as conn:
+        async with DB_POOL.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT * FROM message_tasks ORDER BY created_at DESC")
                 columns = [column[0] for column in cur.description]
@@ -1542,7 +2574,7 @@ async def handle_api_messages_send(request: web.Request):
             return web.json_response({"detail": "Message text is required"}, status=400)
         
         # Получаем список пользователей
-        async with db_pool.acquire() as conn:
+        async with DB_POOL.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT user_id FROM telegram_users")
                 user_ids = [row[0] for row in await cur.fetchall()]
@@ -1586,7 +2618,7 @@ async def handle_api_messages_send(request: web.Request):
                     )
                 success_count += 1
             except Exception as e:
-                logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+                logger.error(f"Ошибка отправки сообщения пользователь {user_id}: {e}")
                 failed_count += 1
         
         return web.json_response({
@@ -1600,58 +2632,58 @@ async def handle_api_messages_send(request: web.Request):
 
 # Функция для сохранения платежа в базу данных
 async def save_payment(payment_data: dict):
-    """Сохраняет информацию о платеже в базу данных."""
+    """Сохраняет информацию о платеже через API."""
     try:
-        async with db_pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                payment_obj = payment_data['object']
-                payment_method = payment_obj['payment_method']
-                user_id = int(payment_obj['metadata']['user_id'])
-                
-                # Проверяем существование пользователя в базе данных
-                await cur.execute("SELECT COUNT(*) FROM telegram_users WHERE user_id = %s", (user_id,))
-                user_exists = (await cur.fetchone())[0] > 0
-                
-                # Если пользователя нет, создаем его автоматически
-                if not user_exists:
-                    logger.info(f"Пользователь {user_id} не найден, создаем автоматически")
-                    await cur.execute(
-                        "INSERT INTO telegram_users (user_id, test_period, created_at) VALUES (%s, 1, CURRENT_TIMESTAMP)",
-                        (user_id,)
-                    )
-                    await conn.commit()
-                    logger.info(f"Пользователь {user_id} успешно создан")
-                
-                # Преобразуем даты
-                created_at = convert_iso_to_mysql_datetime(payment_obj['created_at'])
-                captured_at = convert_iso_to_mysql_datetime(payment_obj['captured_at'])
-                
-                await cur.execute('''
-                    INSERT INTO payments (
-                        payment_id, user_id, amount, income_amount, status,
-                        description, payment_method, payment_method_details,
-                        created_at, captured_at, metadata
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                    )
-                ''', (
-                    payment_obj['id'],
-                    user_id,
-                    float(payment_obj['amount']['value']),
-                    float(payment_obj['income_amount']['value']),
-                    payment_obj['status'],
-                    payment_obj['description'],
-                    payment_method['type'],
-                    str(payment_method),
-                    created_at,
-                    captured_at,
-                    str(payment_obj['metadata'])
-                ))
-                await conn.commit()
-                logger.info(f"Платеж {payment_obj['id']} успешно сохранен в базе данных")
+        payment_obj = payment_data['object']
+        payment_method = payment_obj['payment_method']
+        user_id = int(payment_obj['metadata']['user_id'])
+        
+        # Маппинг методов оплаты YooKassa к допустимым значениям API
+        payment_method_mapping = {
+            'yoo_money': 'yoomoney',
+            'bank_card': 'card',
+            'sbp': 'sbp',
+            'qiwi': 'qiwi',
+            'webmoney': 'webmoney',
+            'cash': 'cash'
+        }
+        
+        # Определение метода оплаты с использованием маппинга или значения по умолчанию
+        method_type = payment_method['type']
+        api_payment_method = payment_method_mapping.get(method_type, 'other')
+        
+        # Формируем данные для сохранения платежа
+        payment_save_data = {
+            "payment_id": payment_obj['id'],
+            "user_id": user_id,
+            "amount": float(payment_obj['amount']['value']),
+            "income_amount": float(payment_obj['income_amount']['value']) if 'income_amount' in payment_obj else None,
+            "status": payment_obj['status'],
+            "description": payment_obj['description'],
+            "payment_method": api_payment_method,
+            "payment_method_details": str(payment_method),
+            "payment_metadata": str(payment_obj['metadata']),
+            "captured_at": payment_obj.get('captured_at')
+        }
+        
+        # Используем async_api_request для отправки запроса
+        result = await async_api_request(
+            "post",
+            f"{MARZBAN_URL}api/payments/save",
+            json_data=payment_save_data
+        )
+        
+        # Проверяем успешность операции
+        if result and result.get("status_code") == 200:
+            # Если ответ успешный, возвращаем успех
+            return {"success": True, "payment_id": payment_obj['id'], "result": result}
+        else:
+            logger.error(f"Ошибка сохранения платежа {payment_obj['id']}: {result}")
+            return {"success": False, "error": "Failed to save payment"}
+    
     except Exception as e:
         logger.error(f"Ошибка при сохранении платежа: {e}")
-        logger.error(traceback.format_exc())
+        return {"success": False, "error": str(e)}
 
 # Обработчик вебхука от YooKassa
 async def handle_yookassa_webhook(request: web.Request):
@@ -1661,21 +2693,26 @@ async def handle_yookassa_webhook(request: web.Request):
         client_ip = request.remote
         # Проверяем, что запрос пришел с IP-адреса ЮKassa
         if not is_ip_allowed(client_ip):
-            logger.error(f"Запрос получен с недопустимого IP-адреса: {client_ip}")
+            logger.error(f"Запрос с недопустимого IP: {client_ip}")
             return web.json_response({"status": "error", "message": "Invalid IP address"}, status=403)
         
         # Парсим JSON из тела запроса
         data = await request.json()
-        logger.info(f"Получен вебхук от YooKassa: {data}")
         
         # Проверяем тип события
         event_type = data.get('event')
         if event_type != 'payment.succeeded':
-            logger.info(f"Получено событие: {event_type}. Ожидалось payment.succeeded.")
             return web.json_response({"status": "ignored"})
         
-        # Сохраняем информацию о платеже
-        await save_payment(data)
+        # Сохраняем информацию о платеже через API
+        save_result = await save_payment(data)
+        
+        if not save_result or not save_result.get("success", False):
+            logger.error(f"Ошибка при обработке вебхука платежа: {save_result}")
+            return web.json_response({
+                "status": "error", 
+                "message": save_result.get("error", "Unknown error during payment saving")
+            }, status=500)
         
         # Получаем ID платежа и метаданные из данных
         payment_id = data['object']['id']
@@ -1687,27 +2724,22 @@ async def handle_yookassa_webhook(request: web.Request):
         # Преобразуем сумму платежа в целое число (если balance INT)
         payment_amount = int(amount_value)
         
-        logger.info(f"Payment ID: {payment_id}, User ID: {user_id}, Amount: {payment_amount}, Subscription Duration: {subscription_duration}")
-        
         # Проверяем статус платежа через API ЮKassa
         payment = Payment.find_one(payment_id)
         if payment.status != 'succeeded':
-            logger.warning(f"Статус платежа {payment_id} не является succeeded.")
             return web.json_response({"status": "ignored"})
         
         # Выполняем все операции: создание/продление, отправку уведомления
         result = await process_successful_payment(user_id, payment_amount, metadata)
         
         if result and result.get("success", False):
-            logger.info(f"Платеж {payment_id} успешно обработан: {result}")
             return web.json_response({"status": "success", "result": result})
         else:
-            logger.error(f"Ошибка при обработке платежа {payment_id}: {result}")
+            logger.error(f"Ошибка при обработке платежа {payment_id}: {result.get('error', 'Unknown error')}")
             return web.json_response({"status": "error", "message": result.get("error", "Unknown error")})
     
     except Exception as e:
-        logger.error(f"Ошибка при обработке вебхука: {e}")
-        logger.error(traceback.format_exc())
+        logger.error(f"Ошибка в обработчике вебхука: {e}")
         return web.json_response({"status": "error", "message": "Internal Server Error"}, status=500)
 
 # Обработка успешного платежа
@@ -1744,7 +2776,6 @@ async def process_successful_payment(user_id: int, payment_amount: int, payment_
                 )
                 await bot.send_message(chat_id=user_id, text=message, parse_mode="HTML")
                 
-                logger.info(f"Успешно создан ключ {username} для пользователя {user_id}")
                 return {"success": True, "username": username, "link": vless_link}
             else:
                 error_message = result.get("error", "Неизвестная ошибка")
@@ -1774,7 +2805,6 @@ async def process_successful_payment(user_id: int, payment_amount: int, payment_
                 )
                 await bot.send_message(chat_id=user_id, text=message, parse_mode="HTML")
                 
-                logger.info(f"Успешно продлен ключ {username} для пользователя {user_id}")
                 return {"success": True, "username": username, "new_expire_date": new_expire_date}
             else:
                 error_message = result.get("error", "Неизвестная ошибка")
@@ -1840,59 +2870,26 @@ async def create_marzban_user(user_id: int, days: int) -> dict:
         # Генерируем уникальное имя пользователя
         marzban_username = f"{generate_random_string()}_{user_id}"
         
-        # Устанавливаем время истечения на указанное количество дней вперед
-        expire_timestamp = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp())
-        expire_date = datetime.fromtimestamp(expire_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-        logger.info(f"Создание ключа: {marzban_username}, срок: {expire_date}")
-
-        # Создаем объект пользователя с настройками
-        new_user = UserCreate(
-            username=marzban_username,
-            proxies={"vless": ProxySettings(flow="xtls-rprx-vision")},
-            inbounds={'vless': ['VLESS TCP REALITY']},
-            expire=expire_timestamp
-        )
-
         # Отладочная информация
         logger.critical(f"[PAYMENT DEBUG] Попытка создания пользователя в Marzban API: {MARZBAN_URL}")
         logger.critical(f"[PAYMENT DEBUG] Имя пользователя для создания: {marzban_username}")
         
-        # Проверка доступности хоста через DNS
-        try:
-            parsed_url = urlparse(MARZBAN_URL)
-            hostname = parsed_url.netloc.split(':')[0]
-            logger.critical(f"[PAYMENT DEBUG] Разбор URL {MARZBAN_URL}. Полученный хост: {hostname}")
-            
-            if hostname != 'localhost' and hostname != '127.0.0.1':
-                try:
-                    ip = socket.gethostbyname(hostname)
-                    logger.critical(f"[PAYMENT DEBUG] Успешное разрешение DNS {hostname} -> {ip}")
-                except Exception as dns_err:
-                    logger.critical(f"[PAYMENT DEBUG] Ошибка при разрешении DNS {hostname}: {dns_err}")
-        except Exception as parse_err:
-            logger.critical(f"[PAYMENT DEBUG] Ошибка при разборе URL {MARZBAN_URL}: {parse_err}")
-
-        # Инициализируем API и создаем пользователя
-        api = MarzbanAPI(base_url=MARZBAN_URL)
-        # Настройки для внутреннего взаимодействия в Docker
-        api.client.verify = False
-        api.client.timeout = httpx.Timeout(30.0, connect=10.0)
+        # Создаем пользователя через базовую функцию
+        result = await create_marzban_user_basic(marzban_username, days, token)
         
-        try:
-            await api.add_user(new_user, token)
-            logger.critical(f"[PAYMENT DEBUG] Пользователь успешно создан в Marzban API")
-        except Exception as e:
-            logger.critical(f"[PAYMENT DEBUG] Ошибка при создании пользователя: {e}")
-            logger.critical(f"[PAYMENT DEBUG] Тип исключения: {type(e).__name__}")
-            return {"success": False, "error": f"Ошибка создания пользователя: {e}"}
+        if not result["success"]:
+            logger.critical(f"[PAYMENT DEBUG] Ошибка при создании пользователя: {result['error']}")
+            return {"success": False, "error": result["error"]}
         
-        # Получаем информацию о созданном пользователе
-        user_info = await api.get_user(marzban_username, token)
-        if not user_info or not user_info.links:
+        if not result["links"]:
             return {"success": False, "error": "Пользователь создан, но не удалось получить ссылку"}
-            
-        vless_link = user_info.links[0]
-        logger.info(f"Пользователь {marzban_username} создан с ссылкой {vless_link}")
+        
+        vless_link = result["links"][0]
+        
+        # Устанавливаем связь с пользователем Telegram
+        link_success = await link_telegram_user_to_marzban(marzban_username, user_id, token)
+        if not link_success:
+            logger.warning(f"Не удалось установить связь с Telegram ID {user_id} для пользователя {marzban_username}")
         
         return {
             "success": True,
@@ -1906,73 +2903,438 @@ async def create_marzban_user(user_id: int, days: int) -> dict:
 
 # Функция для продления существующего пользователя
 async def extend_marzban_user(username: str, days: int) -> dict:
-    """Продлевает существующий ключ на указанное количество дней.
-    
-    Args:
-        username: Имя пользователя в Marzban
-        days: Количество дней для продления
-        
-    Returns:
-        dict: Словарь с результатами операции
-        {
-            "success": bool,
-            "username": str,
-            "new_expire_date": str,
-            "error": str  # только если success=False
-        }
-    """
+    """Продлевает существующий VPN ключ пользователя."""
     try:
-        # Получаем токен
         token = await get_access_token()
         if not token:
-            logger.error("Не удалось получить токен для продления пользователя")
-            return {"success": False, "error": "Ошибка авторизации в Marzban API"}
-
-        # Инициализируем API
-        api = MarzbanAPI(base_url=MARZBAN_URL)
-        api.client.verify = False
-        api.client.timeout = httpx.Timeout(30.0, connect=10.0)
+            return {"success": False, "error": "Не удалось получить токен доступа"}
         
-        # Получаем текущую информацию о пользователе
-        logger.critical(f"[PAYMENT DEBUG] Получение информации о пользователе {username}")
-        user_info = await api.get_user(username, token)
-        if not user_info:
-            return {"success": False, "error": f"Пользователь {username} не найден"}
+        # Сначала получаем информацию о пользователе
+        url = f"{MARZBAN_URL}api/user/{username}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        user_result = await async_api_request("get", url, headers=headers)
+        
+        if not user_result["success"]:
+            return {"success": False, "error": "Пользователь не найден"}
             
-        current_expire = user_info.expire
+        current_user = user_result["data"]
+            
+        # Вычисляем новую дату окончания
+        now = int(datetime.now().timestamp())
         
-        # Рассчитываем новую дату истечения
-        current_time = datetime.now(timezone.utc).timestamp()
-        if current_expire < current_time:
-            new_expire = int(current_time + timedelta(days=days).total_seconds())
-            logger.info(f"Срок действия ключа {username} истек, устанавливаем новый срок от текущей даты")
+        # Если срок уже истек, устанавливаем новую дату от текущего момента
+        if "expire" not in current_user or not current_user["expire"] or current_user["expire"] < now:
+            new_expire = now + (days * 24 * 3600)
         else:
-            new_expire = int(current_expire + timedelta(days=days).total_seconds())
-            logger.info(f"Продление ключа {username} на {days} дней от текущего срока")
+            # Иначе добавляем дни к текущей дате окончания
+            new_expire = current_user["expire"] + (days * 24 * 3600)
         
-        # Обновляем срок действия ключа
-        logger.critical(f"[PAYMENT DEBUG] Продление ключа {username} до {datetime.fromtimestamp(new_expire)}")
-        await api.modify_user(
-            username=username,
-            user=UserModify(expire=new_expire),
-            token=token
-        )
+        # Обновляем пользователя через API
+        new_expire_date = datetime.fromtimestamp(new_expire).strftime('%Y-%m-%d %H:%M:%S')
         
-        # Форматируем дату для удобочитаемости
-        new_expire_date = datetime.fromtimestamp(new_expire, tz=timezone.utc).strftime("%d.%m.%Y")
-        logger.info(f"Успешно продлен ключ {username} до {new_expire_date}")
+        update_data = {"expire": new_expire}
+        update_result = await async_api_request("put", url, headers=headers, json_data=update_data)
+        
+        if not update_result["success"]:
+            return {"success": False, "error": f"Не удалось обновить пользователя: {update_result['error']}"}
+            
+        # Устанавливаем связь с пользователем Telegram через API
+        # Получаем ID пользователя Telegram из username (формат: random_12345)
+        try:
+            telegram_id = int(username.split('_')[-1])
+            await link_telegram_user_to_marzban(username, telegram_id, token)
+        except Exception as e:
+            logger.error(f"Ошибка при установке связи с Telegram пользователем при продлении: {e}")
+        
+        # Получаем обновленного пользователя для получения ссылки
+        updated_result = await async_api_request("get", url, headers=headers)
+        link = None
+        
+        if updated_result["success"] and "links" in updated_result["data"] and updated_result["data"]["links"]:
+            link = updated_result["data"]["links"][0]
         
         return {
             "success": True,
             "username": username,
-            "new_expire_date": new_expire_date
+            "new_expire_date": new_expire_date,
+            "link": link,
+            "days": days
         }
+        
     except Exception as e:
         logger.error(f"Ошибка при продлении ключа {username}: {e}")
         logger.error(traceback.format_exc())
         return {"success": False, "error": str(e)}
 
 # Функция для проверки JWT токена Marzban
+
+# Функция для получения списка пользователей с ключами VPN через API
+async def get_telegram_users_with_keys():
+    """Получает список пользователей Telegram с ключами VPN."""
+    try:
+        # Формируем URL для запроса к API
+        api_base_url = f"{MARZBAN_URL}api"
+        url = f"{api_base_url}/telegram_users_with_keys"
+        
+        # Получаем токен доступа к API
+        token = await get_access_token()
+        if not token:
+            logger.error("Не удалось получить токен для получения списка пользователей")
+            return []
+            
+        # Выполняем запрос к API
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"limit": 1000}  # Ограничиваем выборку 1000 пользователями
+        
+        result = await async_api_request("get", url, headers=headers, params=params)
+        
+        if result["success"]:
+            data = result["data"]
+            return data
+        else:
+            logger.error(f"Ошибка при получении списка пользователей: {result['status_code']} {result['error']}")
+            return []
+    except Exception as e:
+        logger.error(f"Ошибка при получении пользователей с VPN-ключами: {e}")
+        logger.error(traceback.format_exc())
+        return []
+
+def validate_username(username: str) -> bool:
+    """
+    Проверяет безопасность имени пользователя.
+    Имя должно содержать только буквы, цифры, дефисы и нижние подчеркивания.
+    """
+    if not username:
+        return False
+    
+    # Проверяем длину (не слишком короткое и не слишком длинное)
+    if len(username) < 3 or len(username) > 50:
+        return False
+    
+    # Проверяем допустимые символы (буквы, цифры, дефис, нижнее подчеркивание)
+    import re
+    pattern = r'^[a-zA-Z0-9_-]+$'
+    if not re.match(pattern, username):
+        return False
+    
+    # Проверяем отсутствие SQL-инъекций и других опасных паттернов
+    dangerous_patterns = [
+        'DROP', 'DELETE', 'UPDATE', 'INSERT', 
+        'SELECT', 'UNION', 'OR ', 'AND ', 
+        '1=1', '1 = 1', '--', ';', "'", '"'
+    ]
+    
+    upper_username = username.upper()
+    for pattern in dangerous_patterns:
+        if pattern in upper_username:
+            return False
+    
+    return True
+
+
+# === Обработчики для реферальных бонусов ===
+@dp.callback_query(lambda c: c.data.startswith("apply_bonus_"))
+async def apply_bonus_to_key_handler(callback: CallbackQuery):
+    """Обрабатывает выбор ключа для применения бонуса."""
+    user_id = callback.from_user.id
+    
+    try:
+        # Сразу отправляем уведомление о начале обработки
+        await callback.answer("Применяем бонус к ключу...")
+        
+        # Получаем данные из callback_data
+        parts = callback.data.split("_")
+        bonus_id = int(parts[2])
+        key_name = parts[3]
+        
+        
+        # Получаем информацию о бонусе
+        async with DB_POOL.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                query = "SELECT * FROM pending_bonuses WHERE id = %s"
+                await cursor.execute(query, (bonus_id,))
+                bonus_info = await cursor.fetchone()
+                
+                if not bonus_info:
+                    await callback.answer("Бонус не найден или уже был применен", show_alert=True)
+                    return
+                
+                bonus_days = bonus_info['bonus_days']
+                
+                # Продлеваем ключ
+                extend_result = await extend_marzban_user(key_name, bonus_days)
+                
+                if extend_result["success"]:
+                    # Всегда отправляем новое сообщение вместо редактирования
+                    success_message = (
+                        f"✅ <b>Бонус успешно применен!</b>\n\n"
+                        f"Ваш ключ <code>{key_name}</code> был продлен на {bonus_days} дней.\n"
+                        f"Новая дата окончания: {extend_result['new_expire_date']}"
+                    )
+                    
+                    await bot.send_message(
+                        user_id,
+                        success_message,
+                        parse_mode="HTML",
+                        reply_markup=get_back_to_menu_keyboard()
+                    )
+                    
+                    # Удаляем бонус из таблицы ожидающих
+                    delete_query = "DELETE FROM pending_bonuses WHERE id = %s"
+                    await cursor.execute(delete_query, (bonus_id,))
+                    await conn.commit()
+                    
+                else:
+                    error_message = f"Ошибка при применении бонуса: {extend_result.get('error', 'Неизвестная ошибка')}"
+                    await callback.answer(error_message, show_alert=True)
+                    logger.error(f"Ошибка при применении бонуса {bonus_id} к ключу {key_name}: {extend_result.get('error')}")
+    except Exception as e:
+        logger.error(f"Ошибка при применении бонуса к ключу: {e}")
+        logger.error(traceback.format_exc())
+        await callback.answer("Произошла ошибка при применении бонуса", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data.startswith("cancel_bonus_"))
+async def cancel_bonus_handler(callback: CallbackQuery):
+    """Обрабатывает отмену применения бонуса."""
+    user_id = callback.from_user.id
+    
+    try:
+        # Сразу отправляем уведомление о начале обработки
+        await callback.answer("Операция отменена")
+        
+        # Возвращаем меню партнерской программы
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Вернуться в партнерскую программу", callback_data="affiliate")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_main")]
+        ])
+        
+        # Всегда отправляем новое сообщение вместо редактирования
+        await bot.send_message(
+            user_id,
+            "🔄 <b>Вы отменили применение бонуса.</b>\n\n"
+            "Вы можете вернуться в партнерскую программу или выбрать другой раздел из главного меню.",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при отмене бонуса: {e}")
+        logger.error(traceback.format_exc())
+        await callback.answer("Произошла ошибка при отмене бонуса", show_alert=True)
+
+
+# Обработчик выбора ключа для применения бонуса
+@dp.callback_query(lambda c: c.data.startswith("apply_bonus_"))
+async def apply_bonus_to_key_handler(callback: CallbackQuery):
+    """Обрабатывает выбор ключа для применения бонуса."""
+    user_id = callback.from_user.id
+    
+    try:
+        # Получаем данные из callback_data
+        parts = callback.data.split("_")
+        bonus_id = int(parts[2])
+        key_name = parts[3]
+        
+        # Получаем информацию о бонусе
+        async with DB_POOL.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                query = "SELECT * FROM pending_bonuses WHERE id = %s"
+                await cursor.execute(query, (bonus_id,))
+                bonus_info = await cursor.fetchone()
+                
+                if not bonus_info:
+                    await callback.answer("Бонус не найден или уже был применен", show_alert=True)
+                    return
+                
+                bonus_days = bonus_info['bonus_days']
+                
+                # Продлеваем ключ
+                extend_result = await extend_marzban_user(key_name, bonus_days)
+                
+                if extend_result["success"]:
+                    # Обновляем сообщение
+                    await callback.message.edit_text(
+                        f"✅ <b>Бонус успешно применен!</b>\n\n"
+                        f"Ваш ключ <code>{key_name}</code> был продлен на {bonus_days} дней.\n"
+                        f"Новая дата окончания: {extend_result['new_expire_date']}",
+                        parse_mode="HTML",
+                        reply_markup=get_back_to_menu_keyboard()
+                    )
+                    
+                    # Удаляем бонус из таблицы ожидающих
+                    delete_query = "DELETE FROM pending_bonuses WHERE id = %s"
+                    await cursor.execute(delete_query, (bonus_id,))
+                    
+                    # Обновляем выбранный ключ пользователя
+                    update_query = "UPDATE users SET selected_key = %s WHERE id = %s"
+                    await cursor.execute(update_query, (key_name, bonus_info['user_id']))
+                    
+                    await conn.commit()
+                    
+                else:
+                    await callback.answer(
+                        f"Ошибка при применении бонуса: {extend_result.get('error', 'Неизвестная ошибка')}",
+                        show_alert=True
+                    )
+                    logger.error(f"Ошибка при применении бонуса {bonus_id} для ключа {key_name}: {extend_result.get('error', 'Неизвестная ошибка')}")
+    
+    except Exception as e:
+        logger.error(f"Ошибка при применении бонуса к ключу: {e}")
+        logger.error(traceback.format_exc())
+        await callback.answer("Произошла ошибка при применении бонуса", show_alert=True)
+
+
+async def get_telegram_user(user_id: int):
+    """Получение пользователя Telegram через API.
+    
+    Args:
+        user_id: ID пользователя в Telegram
+        
+    Returns:
+        dict: Информация о пользователе или None, если пользователь не найден
+    """
+    try:
+        token = await get_access_token()
+        if not token:
+            return None
+            
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{MARZBAN_URL}api/telegram_user/{user_id}"
+        
+        response = await async_api_request("GET", url, headers=headers)
+        
+        if response and response.get("success") == True:
+            return response.get("data")
+            
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении данных пользователя {user_id}: {e}")
+        return None
+
+
+async def find_user_by_referral_code(referral_code: str) -> Optional[int]:
+    """Ищет пользователя Telegram по реферальному коду.
+    
+    Args:
+        referral_code: Реферальный код пользователя
+        
+    Returns:
+        int: ID пользователя Telegram или None, если пользователь не найден
+    """
+    try:
+        token = await get_access_token()
+        if not token:
+            logger.error("[REFERRAL_DEBUG] Не удалось получить токен доступа для поиска по коду")
+            return None
+            
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{MARZBAN_URL}api/telegram_user/by_code/{referral_code}"
+        
+        response = await async_api_request("GET", url, headers=headers)
+        
+        if response and response.get("success") == True:
+            user_data = response.get("data", {})
+            user_id = user_data.get("user_id")
+            
+            if user_id:
+                return user_id
+            else:
+                logger.warning(f"[REFERRAL_LOG] Пользователь найден по коду, но отсутствует user_id: {response}")
+        else:
+            logger.warning(f"[REFERRAL_LOG] Не удалось найти пользователя по коду {referral_code}: {response}")
+            
+        return None
+    except Exception as e:
+        logger.error(f"[REFERRAL_DEBUG] Ошибка при поиске пользователя по коду {referral_code}: {e}")
+        logger.error(traceback.format_exc())
+        return None
+
+
+# Функция для получения платежей пользователя
+async def get_user_payments(user_id: int, limit: int = 5):
+    """Получает список платежей пользователя через API."""
+    try:
+        # Используем async_api_request для получения данных
+        params = {"limit": limit}
+        result = await async_api_request(
+            "get",
+            f"{MARZBAN_URL}api/payments/user/{user_id}",
+            params=params
+        )
+        
+        if result and result.get("success", True):
+            payments = result.get("data", [])
+            return payments
+        else:
+            logger.warning(f"Не удалось получить платежи пользователя {user_id}")
+            return []
+    
+    except Exception as e:
+        logger.error(f"Ошибка запроса платежей: {e}")
+        return []
+
+# Функция для получения статистики платежей пользователя
+async def get_user_payment_summary(user_id: int):
+    """Получает сводку о платежах пользователя через API."""
+    try:
+        # Используем async_api_request для получения данных
+        result = await async_api_request(
+            "get",
+            f"{MARZBAN_URL}api/payments/user/{user_id}/summary"
+        )
+        
+        if result and result.get("success", True):
+            summary = result.get("data", {})
+            return summary
+        else:
+            logger.warning(f"Не удалось получить сводку платежей пользователя {user_id}")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Ошибка запроса сводки платежей: {e}")
+        return None
+
+@dp.message(Command("my_payments"))
+async def cmd_my_payments(message: types.Message):
+    """Обработчик команды для просмотра истории платежей пользователя."""
+    user_id = message.from_user.id
+    
+    # Получаем последние платежи пользователя
+    payments = await get_user_payments(user_id)
+    
+    if not payments:
+        await message.answer("У вас пока нет платежей в системе.")
+        return
+    
+    # Получаем сводку о платежах
+    summary = await get_user_payment_summary(user_id)
+    
+    # Формируем ответ
+    text = "📊 <b>Ваши платежи:</b>\n\n"
+    
+    for payment in payments:
+        status_emoji = "✅" if payment.get("status") == "succeeded" else "⏳"
+        payment_date = datetime.fromisoformat(payment.get("created_at").replace("Z", "+00:00"))
+        formatted_date = payment_date.strftime("%d.%m.%Y %H:%M")
+        
+        text += f"{status_emoji} <b>ID платежа:</b> {payment.get('payment_id')}\n"
+        text += f"<b>Сумма:</b> {payment.get('amount')} ₽\n"
+        text += f"<b>Статус:</b> {payment.get('status')}\n"
+        text += f"<b>Дата:</b> {formatted_date}\n"
+        if payment.get("description"):
+            text += f"<b>Описание:</b> {payment.get('description')}\n"
+        text += "\n"
+    
+    # Добавляем сводную информацию, если доступна
+    if summary:
+        text += "<b>Общая статистика:</b>\n"
+        text += f"Всего платежей: {summary.get('total_payments')}\n"
+        text += f"Успешных платежей: {summary.get('successful_payments')}\n"
+        text += f"Общая сумма: {summary.get('total_spent')} ₽\n"
+    
+    await message.answer(text, parse_mode="HTML")
 
 
 if __name__ == "__main__":

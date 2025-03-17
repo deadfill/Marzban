@@ -394,3 +394,45 @@ def delete_expired_users(
         )
 
     return removed_users
+
+
+@router.put("/users/{username}/telegram_user", responses={400: responses._400, 404: responses._404})
+def link_user_to_telegram(
+    username: str,
+    telegram_data: dict,
+    db: Session = Depends(get_db),
+    admin: Admin = Depends(Admin.get_current),
+    user = Depends(get_user),
+):
+    """
+    Связывает пользователя Marzban с пользователем Telegram
+    
+    - **telegram_user_id**: ID пользователя Telegram
+    """
+    from app.db.models import TelegramUser
+    
+    try:
+        # Получаем Telegram ID из запроса
+        telegram_user_id = telegram_data.get("telegram_user_id")
+        if not telegram_user_id:
+            raise HTTPException(status_code=400, detail="telegram_user_id is required")
+        
+        # Проверяем существование пользователя Telegram
+        telegram_user = db.query(TelegramUser).filter(TelegramUser.user_id == telegram_user_id).first()
+        if not telegram_user:
+            # Создаем пользователя Telegram, если он не существует
+            telegram_user = TelegramUser(user_id=telegram_user_id)
+            db.add(telegram_user)
+            db.commit()
+            db.refresh(telegram_user)
+            logger.info(f"Created new Telegram user with ID {telegram_user_id}")
+        
+        # Связываем пользователя Marzban с пользователем Telegram
+        user.telegram_user_id = telegram_user.id
+        db.commit()
+        
+        logger.info(f"Linked Marzban user {username} with Telegram user {telegram_user_id}")
+        return {"detail": "User successfully linked to Telegram user"}
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Error linking user to Telegram user")

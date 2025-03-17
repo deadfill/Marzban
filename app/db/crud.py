@@ -29,6 +29,8 @@ from app.db.models import (
     UserTemplate,
     UserUsageResetLogs,
     MessageTask,
+    Payment,
+    TelegramUser,
 )
 from app.models.admin import AdminCreate, AdminModify, AdminPartialModify
 from app.models.node import NodeCreate, NodeModify, NodeStatus, NodeUsageResponse
@@ -1588,3 +1590,63 @@ def get_users_by_expiration_days(db: Session, days: int):
         User.status == UserStatus.active,
         User.expire.between(start_timestamp, end_timestamp)
     ).all()
+
+def get_telegram_user_by_id(db: Session, user_id: int):
+    """
+    Получение пользователя Telegram по его ID
+    """
+    return db.query(TelegramUser).filter(TelegramUser.user_id == user_id).first()
+
+# Функции для работы с платежами
+
+def get_payment_by_id(db: Session, payment_id: str):
+    """
+    Получение платежа по его ID
+    """
+    return db.query(Payment).filter(Payment.payment_id == payment_id).first()
+
+
+def get_user_payments(
+    db: Session, 
+    user_id: int, 
+    status: Optional[str] = None,
+    limit: int = 100, 
+    offset: int = 0
+):
+    """
+    Получение списка платежей пользователя
+    """
+    query = db.query(Payment).filter(Payment.user_id == user_id)
+    
+    if status:
+        query = query.filter(Payment.status == status)
+    
+    return query.order_by(Payment.created_at.desc()).offset(offset).limit(limit).all()
+
+
+def create_payment(db: Session, payment_data: dict):
+    """
+    Создание нового платежа
+    """
+    payment = Payment(**payment_data)
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def update_payment(db: Session, payment_id: str, payment_data: dict):
+    """
+    Обновление существующего платежа
+    """
+    payment = get_payment_by_id(db, payment_id)
+    if not payment:
+        return None
+    
+    for key, value in payment_data.items():
+        if hasattr(payment, key) and value is not None:
+            setattr(payment, key, value)
+    
+    db.commit()
+    db.refresh(payment)
+    return payment

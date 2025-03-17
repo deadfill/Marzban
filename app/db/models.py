@@ -15,6 +15,7 @@ from sqlalchemy import (
     Table,
     UniqueConstraint,
     func,
+    Numeric,
 )
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import relationship
@@ -58,6 +59,32 @@ class AdminUsageLogs(Base):
     reset_at = Column(DateTime, default=datetime.utcnow)
 
 
+class TelegramUser(Base):
+    __tablename__ = "telegram_users"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, nullable=False, unique=True, index=True)  # Telegram ID пользователя
+    username = Column(String(100), nullable=True)  # Имя пользователя в Telegram
+    first_name = Column(String(100), nullable=True)  # Имя пользователя
+    last_name = Column(String(100), nullable=True)  # Фамилия пользователя
+    created_at = Column(DateTime, default=datetime.utcnow)
+    test_period = Column(Boolean, nullable=False, default=False, server_default=text("0"))  # Флаг использования тестового периода
+    
+    # Реферальная система
+    referral_code = Column(String(20), nullable=True, unique=True, index=True)  # Уникальный код для приглашений
+    referrer_id = Column(Integer, ForeignKey("telegram_users.id"), nullable=True)  # ID пользователя, пригласившего текущего
+    
+    # Связи для реферальной системы
+    referrer = relationship("TelegramUser", remote_side=[id], backref="referrals", foreign_keys=[referrer_id])
+    referral_bonuses = relationship("ReferralBonus", back_populates="telegram_user")
+    
+    # Связь с пользователями Marzban (один телеграм аккаунт может иметь много пользователей Marzban)
+    marzban_users = relationship("User", back_populates="telegram_user")
+    
+    # Связь с платежами (один телеграм аккаунт может иметь много платежей)
+    payments = relationship("Payment", back_populates="telegram_user", foreign_keys="Payment.user_id")
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -94,6 +121,10 @@ class User(Base):
 
     edit_at = Column(DateTime, nullable=True, default=None)
     last_status_change = Column(DateTime, default=datetime.utcnow, nullable=True)
+
+    # Связь с Telegram пользователем
+    telegram_user_id = Column(Integer, ForeignKey("telegram_users.id"), nullable=True, index=True)
+    telegram_user = relationship("TelegramUser", back_populates="marzban_users")
 
     next_plan = relationship(
         "NextPlan",
@@ -363,3 +394,37 @@ class MessageTask(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     last_run = Column(DateTime, nullable=True)
     next_run = Column(DateTime, nullable=True)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    
+    payment_id = Column(String(255), primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("telegram_users.user_id"), nullable=False)
+    amount = Column(Numeric(10, 2), nullable=False) 
+    income_amount = Column(Numeric(10, 2), nullable=True)
+    status = Column(String(50), nullable=False)
+    description = Column(String(1000), nullable=True)
+    payment_method = Column(String(50), nullable=True)
+    payment_method_details = Column(String(1000), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    captured_at = Column(DateTime, nullable=True)
+    payment_metadata = Column(String(1000), nullable=True)
+    
+    # Отношение к пользователю Telegram (у платежа только один пользователь Telegram)
+    telegram_user = relationship("TelegramUser", back_populates="payments", foreign_keys=[user_id])
+
+
+class ReferralBonus(Base):
+    __tablename__ = "referral_bonuses"
+    
+    id = Column(Integer, primary_key=True)
+    telegram_user_id = Column(Integer, ForeignKey("telegram_users.id"), nullable=False)
+    telegram_user = relationship("TelegramUser", back_populates="referral_bonuses")
+    
+    amount = Column(Numeric(10, 2), nullable=False)  # Размер бонуса (количество дней)
+    bonus_type = Column(String(50), nullable=False, default="days")  # Тип бонуса (всегда days)
+    is_applied = Column(Boolean, default=False)  # Применен ли бонус
+    created_at = Column(DateTime, default=datetime.utcnow)
+    applied_at = Column(DateTime, nullable=True)  # Когда бонус был применен
+    expires_at = Column(DateTime, nullable=True)  # Дата истечения бонуса

@@ -1,4 +1,5 @@
 ARG PYTHON_VERSION=3.12
+ARG VERSION=dev
 
 FROM python:$PYTHON_VERSION-slim AS build
 
@@ -32,4 +33,11 @@ RUN ln -s /code/marzban-cli.py /usr/bin/marzban-cli \
     && chmod +x /usr/bin/marzban-cli \
     && marzban-cli completion install --shell bash
 
-CMD ["bash", "-c", "alembic upgrade head; python main.py"]
+CMD ["bash", "-c", "alembic upgrade heads; python main.py"]
+
+# Устанавливаем метки
+LABEL version=$VERSION
+LABEL org.opencontainers.image.version=$VERSION
+
+# Передаем версию в приложение, например через переменную окружения
+ENV APP_VERSION=$VERSION
