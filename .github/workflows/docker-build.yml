@@ -23,6 +23,9 @@ jobs:
       - name: Bump version
         id: bump_version
         run: |
+          # Сначала синхронизируемся с удаленным репозиторием
+          git pull origin main
+          
           # Получаем текущую версию из файла version.txt
           if [ -f version.txt ]; then
             CURRENT_VERSION=$(cat version.txt)
@@ -40,9 +43,6 @@ jobs:
           # Записываем новую версию в файл
           echo "$NEW_VERSION" > version.txt
           
-          # Сохраняем новую версию для дальнейших шагов
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          
           # Настраиваем git для коммита
           git config --global user.name 'GitHub Actions'
           git config --global user.email 'github-actions@github.com'
@@ -51,6 +51,9 @@ jobs:
           git add version.txt
           git commit -m "Bump version to $NEW_VERSION [skip ci]"
           git push https://${{ secrets.PAT }}@github.com/deadfill/Marzban.git HEAD:main
+          
+          # Выводим новую версию
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
   build:
     needs: version
